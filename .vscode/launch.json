@@ -1,0 +1,26 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: File corrente",
+            "type": "python",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "test-lama",
+            "type": "python",
+            "request": "launch",
+            "program": "bin/predict.py",
+            "cwd": "${workspaceFolder}/external/lama",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "args": ["model.path=${workspaceFolder}/external/lama/big-lama", "indir=${workspaceFolder}/external/lama/LaMa_test_images", "outdir=${workspaceFolder}/external/lama/output"]
+        },
+    ]
+}   

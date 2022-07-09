@@ -1,0 +1,11 @@
+indir: /Users/albertoparravicini/Documents/repositories/human-vaporizer/external/lama/LaMa_test_images
+outdir: /Users/albertoparravicini/Documents/repositories/human-vaporizer/external/lama/output
+model:
+  path: /Users/albertoparravicini/Documents/repositories/human-vaporizer/external/lama/big-lama
+  checkpoint: best.ckpt
+dataset:
+  kind: default
+  img_suffix: .png
+  pad_out_to_modulo: 8
+device: cuda
+out_key: inpainted

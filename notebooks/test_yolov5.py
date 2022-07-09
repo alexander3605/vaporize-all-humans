@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Jul  8 08:09:11 2022
+
+@author: albertoparravicini
+"""
+
+import torch
+import os
+from PIL import Image
+from typing import Union, Optional
+import torchvision.transforms as T
+import torchvision.transforms.functional as functional
+import numpy as np
+from torchtyping import TensorType
+from omegaconf import OmegaConf
+import yaml
+import cv2
+from torchvision.utils import make_grid
+from copy import copy
+
+from dataclasses import dataclass
+from torchvision.models.segmentation import fcn_resnet50
+from vaporize_all_humans.utils import is_image_file, F, C, H, W
+from external.lama.saicinpainting.training.trainers.default import (
+    DefaultInpaintingTrainingModule,
+)
+
+DATA_FOLDER = "data/samples"
+GOLDEN_FOLDER = os.path.join(DATA_FOLDER, "golden")
+BOUNDING_BOX_INCREASE_FACTOR = 0.5
+BOUNDING_BOX_MIN_SIZE = 224
+
+
+@dataclass
+class BoundingBox:
+    xmin: int
+    xmax: int
+    ymin: int
+    ymax: int
+    index: int
+    confidence: float
+
+    def __post_init__(self) -> None:
+        self.xmin = int(self.xmin)
+        self.xmax = int(self.xmax)
+        self.ymin = int(self.ymin)
+        self.ymax = int(self.ymax)
+        self._original_box = copy(self)
+
+    def iou(self, other: "BoundingBox") -> float:
+        # Determine the (x, y)-coordinates of the intersection rectangle
+        xmin_intersection = max(self.xmin, other.xmin)
+        ymin_intersection = max(self.ymin, other.ymin)
+        xmax_intersection = min(self.xmax, other.xmax)
+        ymax_intersection = min(self.ymax, other.ymax)
+        # Compute the area of intersection rectangle. The sides
+        # of the intersection rectangle must both be positive
+        intersection_area = max(0, xmax_intersection - xmin_intersection) * max(
+            0, ymax_intersection - ymin_intersection
+        )
+        # Compute the area of the two bounding boxes. The union area
+        # is the sum of the two areas minus the intersection area
+        self_area = np.prod(self.shape)
+        other_area = np.prod(other.shape)
+        union_area = self_area + other_area - intersection_area
+        # Compute IoU
+        return intersection_area / union_area if union_area > 0 else 0
+
+    def scale(self, scaling_factor: float) -> "BoundingBox":
+        """
+        Increase the size of bounding boxes by a proportional scaling factor.
+        The size is increased keeping the center constant
+        """
+        height, width = self.shape
+        xfactor = int(width * (scaling_factor / 2))
+        yfactor = int(height * (scaling_factor / 2))
+        self.xmin -= xfactor
+        self.xmax += xfactor
+        self.ymin -= yfactor
+        self.ymax += yfactor
+        return self
+
+    def to_square(self, minimum_length: int) -> "BoundingBox":
+        height, width = self.shape
+        new_height = new_width = max(height, width)
+        # If we enforce the minimum length, we do a final cropping in the end
+        enforce_size = False
+        if new_height < minimum_length:
+            new_height = new_width = minimum_length
+            enforce_size = True
+        delta_y = int(np.ceil((new_height - height) / 2))
+        delta_x = int(np.ceil((new_width - width) / 2))
+        assert delta_y >= 0
+        assert delta_x >= 0
+        self.xmin -= delta_x
+        self.xmax += delta_x
+        self.ymin -= delta_y
+        self.ymax += delta_y
+        # Ensure we have a perfect square, there might be issues with rounding
+        if self.shape[0] != self.shape[1]:
+            self._to_square_fix()
+        # Do a final cropping, in case a minimum size was requested
+        if enforce_size:
+            delta = self.shape[0] - minimum_length
+            self.xmax -= delta
+            self.ymax -= delta
+        assert (
+            self.shape[0] == self.shape[1]
+        ), f"shape should be square, not {self.shape}"
+        return self
+
+    def _to_square_fix(self):
+        height, width = self.shape
+        new_height, new_width = [max(height, width)] * 2
+        delta_y = new_height - height
+        delta_x = new_width - width
+        assert delta_y >= 0
+        assert delta_x >= 0
+        self.xmax += delta_x
+        self.ymax += delta_y
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        # Max coordinates are exclusive, min coordinates are inclusive
+        return (self.ymax - self.ymin, self.xmax - self.xmin)
+
+    def __str__(self) -> str:
+        return f"[x=({int(self.xmin)}, {int(self.xmax)}), y=({int(self.ymin)}, {int(self.ymax)})]"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
+@dataclass
+class InpainingMask:
+    box: BoundingBox
+    img: TensorType["C", "H", "W", float]
+    mask: TensorType["H", "W", float]
+    inpainted_img: TensorType["C", "H", "W", float] = None
+
+    def opening(self, erode: int = 15, dilate: int = 50) -> "InpainingMask":
+        kernel = np.ones((erode, erode), np.uint8)
+        mask = cv2.erode(self.mask.numpy(), kernel, iterations=1)
+        kernel = np.ones((dilate, dilate), np.uint8)
+        self.mask = torch.Tensor(cv2.dilate(mask, kernel, iterations=1))
+        return self
+
+    def show(self) -> None:
+        # Overlay the mask over the original picture
+        overlay = Image.new("RGB", list(self.img.shape[1:]), "red")
+        image_with_overlay = T.ToPILImage()(self.img.clone())
+        mask = T.ToPILImage()(self.mask * 0.3)
+        image_with_overlay.paste(overlay, (0, 0), mask)
+        # image_with_overlay = T.ToTensor()(Image.composite(original_img, overlay, mask).convert("RGB"))
+        image_with_overlay = T.ToTensor()(image_with_overlay.convert("RGB"))
+        # Stack all images into a grid
+        images_stacked = [
+            self.img,
+            self.mask.unsqueeze(0).repeat(3, 1, 1),
+            image_with_overlay,
+        ]
+        # Show inpainting result if available
+        if self.inpainted_img is not None:
+            images_stacked += [self.inpainted_img]
+        grid = make_grid(images_stacked, nrow=len(images_stacked), padding=0)
+        T.ToPILImage()(grid).show()
+
+
+class ObjectDetection:
+    def __init__(self, threshold: float = 0.5) -> None:
+        # Download the model (this will be cached for future reuse)
+        self.model = torch.hub.load(
+            "ultralytics/yolov5", "yolov5s", pretrained=True, verbose=False
+        )
+        # Only detect persons
+        self.model.classes = [0]
+        # Somewhat low confidence, to detect small persons
+        self.model.conf = threshold
+        # Smaller IoU threhsold
+        self.model.iou = 0.45
+
+    def __call__(self, img_path: str) -> list[BoundingBox]:
+        # Read the image to obtain its shape,
+        # we want to do object detection at high resolution to be more accurate
+        img = Image.open(img_path)
+        # Predict bounding boxes of people
+        with torch.no_grad():
+            results = self.model(img_path, size=img.size[0])
+        # Get bounding boxes
+        boxes_dataframe = results.pandas().xyxy[0]
+        return [
+            BoundingBox(r["xmin"], r["xmax"], r["ymin"], r["ymax"], i, r["confidence"])
+            for i, r in boxes_dataframe.iterrows()
+        ]
+
+
+class SemanticSegmentation:
+
+    # Class index of `person`, in COCO.
+    # Reference: https://pytorch.org/vision/0.11/models.html#semantic-segmentation
+    PERSON_INDEX_IN_COCO = 15
+
+    def __init__(self, threshold: float = 0.5, normalize: bool = True, process_in_batch: bool = True):
+        # Initialize semanting segmentation model
+        self.model = fcn_resnet50(pretrained=True)
+        self.model.eval()
+        self.threshold = threshold
+        self.normalize = normalize
+        self.process_in_batch = process_in_batch
+        
+    def __call__(
+        self,
+        img: Union[torch.Tensor, Image.Image],
+        bounding_boxes: Optional[list[BoundingBox]] = None,
+    ) -> list[InpainingMask]:
+        
+        def _inner_computation(batch: TensorType["F", "C", "H", "W"]) -> TensorType["H", "W"]:
+            with torch.no_grad():
+                prediction = self.model(batch)["out"]
+                prediction = prediction.softmax(dim=1)
+                mask = (prediction[:, SemanticSegmentation.PERSON_INDEX_IN_COCO, ...] > self.threshold).float()
+                return mask
+        
+        # Ensure we are dealing with a tensor
+        if isinstance(img, Image.Image):
+            img = T.ToTensor()(img)
+        # Normalize image
+        if self.normalize:
+            _img = functional.normalize(
+                img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=False
+            )
+        else:
+            _img = img.clone()
+        # Extract crops from the image
+        if bounding_boxes is not None and all_images_have_same_size(bounding_boxes):
+            crops = [_img[:, b.ymin : b.ymax, b.xmin : b.xmax] for b in bounding_boxes]
+            batch = torch.stack(crops, dim=0)
+        else:
+            # Turn the input into a batch
+            batch = _img.unsqueeze(0)
+
+        # Predict the segmentation mask       
+        if bounding_boxes is None:
+            # Case 1: just a single image
+            batch = _img.unsqueeze(0)
+            masks = [_inner_computation(batch)[0]]
+            # No bounding box is present in this case
+            bounding_boxes = [None]
+        else:
+            crops = [_img[:, b.ymin : b.ymax, b.xmin : b.xmax] for b in bounding_boxes]
+            if self.process_in_batch and all_images_have_same_size(bounding_boxes):
+                # Case 2: process all images in a single batch, if they have the same size
+                batch = torch.stack(crops, dim=0)
+                masks = torch.unbind(_inner_computation(batch))
+            else:
+                # Case 3: process images individually, if they have different sizes
+                masks = [_inner_computation(c.unsqueeze(dim=0))[0] for c in crops]
+
+        # Assemble the predicted mask(s) into a list of `InpainingMask`
+        return [
+            InpainingMask(box, img[:, box.ymin : box.ymax, box.xmin : box.xmax], mask)
+            for (box, mask) in zip(boxes, masks)
+        ]
+
+
+class Inpainting:
+
+    # TODO: use smaller model
+    LAMA_CONFIG_DIR = "external/lama/big-lama"
+    LAMA_CHECKPOINT = "best.ckpt"
+    PAD_TO_MODULO = 8
+
+    def __init__(self, process_in_batch: bool = True):
+
+        train_config_path = os.path.join(Inpainting.LAMA_CONFIG_DIR, "config.yaml")
+        with open(train_config_path, "r") as f:
+            train_config = OmegaConf.create(yaml.safe_load(f))
+            train_config.training_model.predict_only = True
+            train_config.visualizer.kind = "noop"
+            checkpoint_path = os.path.join(
+                Inpainting.LAMA_CONFIG_DIR, "models", Inpainting.LAMA_CHECKPOINT
+            )
+            self.model = self._load_checkpoint(train_config, checkpoint_path)
+        self.model.freeze()
+        self.process_in_batch = process_in_batch
+
+    def _load_checkpoint(
+        self, train_config, checkpoint_path, map_location="cpu", strict=False
+    ):
+        kwargs = dict(train_config.training_model)
+        kwargs["use_ddp"] = False
+        kwargs.pop("kind")
+        model: torch.nn.Module = DefaultInpaintingTrainingModule(train_config, **kwargs)
+        state = torch.load(checkpoint_path, map_location=map_location)
+        model.load_state_dict(state["state_dict"], strict=strict)
+        model.on_load_checkpoint(state)
+        return model
+
+    def __call__(self, inpaintings: list[InpainingMask]) -> list[InpainingMask]:
+
+        def _ceil_modulo(x, mod):
+            if x % mod == 0:
+                return x
+            return (x // mod + 1) * mod
+
+        def _pad_img_to_modulo(img: torch.Tensor, modulo: int):
+            height, width = img.shape[-2:]
+            out_height = _ceil_modulo(height, modulo)
+            out_width = _ceil_modulo(width, modulo)
+            padded_shape = [0, 0, out_height - height, out_width - width]
+            take_first_dim= False
+            if len(img.shape) == 2:
+                img = img.unsqueeze(dim=0)
+                take_first_dim = True
+            img = functional.pad(img, padded_shape, padding_mode="symmetric")
+            if take_first_dim:
+                img = img[0]
+            return img
+
+        def _inner_computation(inpaintings: list[InpainingMask]) -> list[InpainingMask]:
+            imgs = []
+            masks = []
+            # Used to restore the original image shape
+            original_image_size = None
+            for x in inpaintings:
+                # Process each image to create a batch
+                if Inpainting.PAD_TO_MODULO > 0:
+                    original_image_size = x.img.shape[1:]
+                    img = _pad_img_to_modulo(x.img, Inpainting.PAD_TO_MODULO)
+                    mask = _pad_img_to_modulo(x.mask, Inpainting.PAD_TO_MODULO)
+                else:
+                    img = x.img
+                    mask = x.mask
+                imgs += [img]
+                masks += [mask.unsqueeze(dim=0)]
+            # Assemble the batch
+            imgs = torch.stack(imgs, dim=0)
+            masks = torch.stack(masks, dim=0)
+            batch = {"image": imgs, "mask": masks}
+            # Compute inpainting
+            batch = self.model(batch)
+            # Retrieve the result, and ensure it has the correct size
+            inpainted = batch["inpainted"]
+            if original_image_size is not None:
+                original_height, original_width = original_image_size
+                inpainted = inpainted[..., :original_height, :original_width]
+            for i, x in enumerate(inpaintings):
+                x.inpainted_img = inpainted[i, ...]
+            return inpaintings
+
+        with torch.no_grad():
+            # Use a single batch if images have the same size and a flag has been specified
+            # If not, process them one by one
+            if self.process_in_batch and all_images_have_same_size([x.img for x in inpaintings]):
+                inpaintings = _inner_computation(inpaintings)
+            else:
+                # Process images independently
+                inpaintings = [_inner_computation([x])[0] for x in inpaintings]
+            return inpaintings
+
+
+def all_images_have_same_size(images: Union[list[torch.Tensor], list[BoundingBox]]) -> bool:
+    first_size = images[0].shape
+    return all([x.shape == first_size for x in images])
+
+
+def psnr(
+    x: TensorType["C", "H", "W", float],
+    y: TensorType["C", "H", "W", float],
+    peak: float = 255,
+):
+    return 10 * np.log10(peak**2 / torch.mean((x - y) ** 2).numpy())
+
+
+#%% Vaporize humans
+if __name__ == "__main__":
+
+    # Images
+    imgs = sorted(
+        [
+            os.path.join(DATA_FOLDER, x)
+            for x in os.listdir(DATA_FOLDER)
+            if is_image_file(x)
+        ]
+    )[:1]
+
+    # Initialize model for object detection
+    object_detection = ObjectDetection()
+
+    # Initialize model for semanting segmentation
+    semanting_segmentation = SemanticSegmentation()
+
+    # Initialize model for inpaining
+    inpainting = Inpainting()
+
+    # Inference
+    for i, image_path in enumerate(imgs):
+
+        # Get bounding boxes of humans
+        boxes = object_detection(image_path)
+
+        # Increase each box by 10%, then make it square (and at least 224x224 in size)
+        for b in boxes:
+            b.scale(BOUNDING_BOX_INCREASE_FACTOR).to_square(BOUNDING_BOX_MIN_SIZE)
+
+        # Semanting segmentation on each bounding box, create segmentation mask for humans
+        img = Image.open(image_path)
+        img = T.ToTensor()(img)
+        masks = semanting_segmentation(img, boxes)
+
+        # Clean and expand segmentation masks, to improve inpainting
+        # TODO: remove any segmentation from the border
+        # https://stackoverflow.com/questions/65534370/remove-the-element-attached-to-the-image-border
+        for m in masks:
+            m.opening()
+
+        # TODO: handle shadows: identify each contiguous region in the mask, flip it vertically, shift it down, and extrude
+        # To identify regions, use the original bounding boxes. Extend them by 10% to be safe, but only left/right/top, not bottom
+
+        # TODO: merge blocks with IoU above a 0.7. Keep the mask with biggest white area
+
+        # Vaporize humans
+        masks = inpainting(masks)
+
+        # Visualize inpainted masks
+        for m in masks:
+            m.show()
+
+        # Assemble final image
+        final_img = img.clone()
+        for m in masks:
+            # Don't merge full patch, but only masked part.
+            # TODO: average inpainting results before updating the original image
+            inpainted_patch = torch.where(m.mask.bool(), m.inpainted_img, m.img)
+            final_img[
+                :, m.box.ymin : m.box.ymax, m.box.xmin : m.box.xmax
+            ] = inpainted_patch
+        T.ToPILImage()(final_img).show()
+
+        # Compute PSNR w.r.t. manually retouched image
+        if os.path.basename(image_path) in os.listdir(GOLDEN_FOLDER):
+            golden = T.ToTensor()(
+                Image.open(os.path.join(GOLDEN_FOLDER, os.path.basename(image_path)))
+            )
+            print(f"PSNR={psnr(final_img, golden):.4f} dB")

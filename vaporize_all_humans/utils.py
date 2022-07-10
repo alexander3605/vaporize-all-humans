@@ -1,4 +1,6 @@
-from typing import TypeVar
+from typing import TypeVar, Any, Callable
+from functools import wraps
+import time
 
 
 F = TypeVar("F")  # Frames
@@ -28,3 +30,17 @@ def is_image_file(filename: str) -> bool:
     :return: Whether the filename has any one of the supported file extensions
     """
     return any(filename.endswith(extension) for extension in IMG_EXTENSIONS)
+
+
+def timeit(name: str = ""):
+    def _timeit(f: Callable):
+        @wraps(f)
+        def wrap(*args: Any, **kwargs: Any):
+            s = time.time()
+            result = f(*args, **kwargs)
+            e = time.time()
+            function_name = name if name else f.__name__
+            print(f"function: {function_name}, time: {e - s:.2f} sec")
+            return result
+        return wrap
+    return _timeit

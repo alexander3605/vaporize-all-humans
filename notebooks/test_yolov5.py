@@ -19,6 +19,8 @@ import yaml
 import cv2
 from torchvision.utils import make_grid
 from copy import copy
+from abc import abstractmethod
+from enum import Enum
 
 from dataclasses import dataclass
 from torchvision.models.segmentation import fcn_resnet50
@@ -31,6 +33,7 @@ DATA_FOLDER = "data/samples"
 GOLDEN_FOLDER = os.path.join(DATA_FOLDER, "golden")
 BOUNDING_BOX_INCREASE_FACTOR = 0.5
 BOUNDING_BOX_MIN_SIZE = 224
+IOU_FILTER_THRESHOLD = 0.5
 
 
 @dataclass
@@ -140,7 +143,7 @@ class InpainingMask:
     mask: TensorType["H", "W", float]
     inpainted_img: TensorType["C", "H", "W", float] = None
 
-    def opening(self, erode: int = 15, dilate: int = 50) -> "InpainingMask":
+    def opening(self, erode: int = 2, dilate: int = 15) -> "InpainingMask":
         kernel = np.ones((erode, erode), np.uint8)
         mask = cv2.erode(self.mask.numpy(), kernel, iterations=1)
         kernel = np.ones((dilate, dilate), np.uint8)
@@ -179,7 +182,7 @@ class ObjectDetection:
         # Somewhat low confidence, to detect small persons
         self.model.conf = threshold
         # Smaller IoU threhsold
-        self.model.iou = 0.45
+        self.model.iou = 0.7
 
     def __call__(self, img_path: str) -> list[BoundingBox]:
         # Read the image to obtain its shape,
@@ -202,27 +205,36 @@ class SemanticSegmentation:
     # Reference: https://pytorch.org/vision/0.11/models.html#semantic-segmentation
     PERSON_INDEX_IN_COCO = 15
 
-    def __init__(self, threshold: float = 0.5, normalize: bool = True, process_in_batch: bool = True):
+    def __init__(
+        self,
+        threshold: float = 0.5,
+        normalize: bool = True,
+        process_in_batch: bool = True,
+    ):
         # Initialize semanting segmentation model
         self.model = fcn_resnet50(pretrained=True)
         self.model.eval()
         self.threshold = threshold
         self.normalize = normalize
         self.process_in_batch = process_in_batch
-        
+
     def __call__(
         self,
         img: Union[torch.Tensor, Image.Image],
         bounding_boxes: Optional[list[BoundingBox]] = None,
     ) -> list[InpainingMask]:
-        
-        def _inner_computation(batch: TensorType["F", "C", "H", "W"]) -> TensorType["H", "W"]:
+        def _inner_computation(
+            batch: TensorType["F", "C", "H", "W"]
+        ) -> TensorType["H", "W"]:
             with torch.no_grad():
                 prediction = self.model(batch)["out"]
                 prediction = prediction.softmax(dim=1)
-                mask = (prediction[:, SemanticSegmentation.PERSON_INDEX_IN_COCO, ...] > self.threshold).float()
+                mask = (
+                    prediction[:, SemanticSegmentation.PERSON_INDEX_IN_COCO, ...]
+                    > self.threshold
+                ).float()
                 return mask
-        
+
         # Ensure we are dealing with a tensor
         if isinstance(img, Image.Image):
             img = T.ToTensor()(img)
@@ -241,7 +253,7 @@ class SemanticSegmentation:
             # Turn the input into a batch
             batch = _img.unsqueeze(0)
 
-        # Predict the segmentation mask       
+        # Predict the segmentation mask
         if bounding_boxes is None:
             # Case 1: just a single image
             batch = _img.unsqueeze(0)
@@ -299,7 +311,6 @@ class Inpainting:
         return model
 
     def __call__(self, inpaintings: list[InpainingMask]) -> list[InpainingMask]:
-
         def _ceil_modulo(x, mod):
             if x % mod == 0:
                 return x
@@ -310,7 +321,7 @@ class Inpainting:
             out_height = _ceil_modulo(height, modulo)
             out_width = _ceil_modulo(width, modulo)
             padded_shape = [0, 0, out_height - height, out_width - width]
-            take_first_dim= False
+            take_first_dim = False
             if len(img.shape) == 2:
                 img = img.unsqueeze(dim=0)
                 take_first_dim = True
@@ -353,7 +364,9 @@ class Inpainting:
         with torch.no_grad():
             # Use a single batch if images have the same size and a flag has been specified
             # If not, process them one by one
-            if self.process_in_batch and all_images_have_same_size([x.img for x in inpaintings]):
+            if self.process_in_batch and all_images_have_same_size(
+                [x.img for x in inpaintings]
+            ):
                 inpaintings = _inner_computation(inpaintings)
             else:
                 # Process images independently
@@ -361,7 +374,148 @@ class Inpainting:
             return inpaintings
 
 
-def all_images_have_same_size(images: Union[list[torch.Tensor], list[BoundingBox]]) -> bool:
+class Blending:
+    def __init__(
+        self,
+        method: str = "average",
+        show_inpainted_image: bool = False,
+        show_inpainting_mask: bool = False,
+    ) -> None:
+        self._method = BlendingEnum.from_string(method)
+        self.show_inpainted_image = show_inpainted_image
+        self.show_inpainting_mask = show_inpainting_mask
+
+    def __call__(
+        self, img: Union[torch.Tensor, Image.Image], inpaintings: list[InpainingMask]
+    ) -> Image.Image:
+        # Ensure we are dealing with a tensor
+        if isinstance(img, Image.Image):
+            img = T.ToTensor()(img)
+        final_img, inpainted_img, inpainting_counts = self._method(img, inpaintings)
+        final_img = T.ToPILImage()(final_img)
+        # Visualize blending results
+        if (
+            self.show_inpainting_mask
+            and inpainted_img is not None
+            and inpainting_counts is not None
+        ):
+            inpainted_img = T.ToPILImage()(inpainted_img)
+            inpainting_counts = T.ToPILImage()(inpainting_counts)
+            inpainted_img.show()
+            inpainting_counts.show()
+        if self.show_inpainted_image:
+            final_img.show()
+        return final_img
+
+
+class BlendingImpl:
+    @abstractmethod
+    def __call__(
+        self, img: torch.Tensor, inpaintings: list[InpainingMask]
+    ) -> torch.Tensor:
+        pass
+
+
+class AverageBlending(BlendingImpl):
+    def __call__(
+        self, img: torch.Tensor, inpaintings: list[InpainingMask]
+    ) -> torch.Tensor:
+        # Assemble final image
+        inpainted_img = torch.zeros_like(img)  # Store all inpainted regions here
+        inpainting_counts = torch.zeros_like(
+            img
+        )  # Count how many pixels have been added to each spot
+        for m in inpaintings:
+            # Store the inpainted patch into a new image
+            inpainted_patch = torch.where(
+                m.mask.bool(), m.inpainted_img, torch.scalar_tensor(0).float()
+            )
+            inpainted_img[
+                :, m.box.ymin : m.box.ymax, m.box.xmin : m.box.xmax
+            ] += inpainted_patch
+            # Update how many times each pixel in the image has been inpainted
+            inpainted_count_patch = torch.where(m.mask.bool(), 1, 0)
+            inpainting_counts[
+                :, m.box.ymin : m.box.ymax, m.box.xmin : m.box.xmax
+            ] += inpainted_count_patch
+        # Average the inpaintings of all the images.
+        # Set all counts at least to 1 to avoid division-by-zero
+        inpainted_img /= torch.maximum(
+            inpainting_counts, torch.ones_like(inpainting_counts)
+        )
+        # Create mask to merge original image with inpainted spots
+        mask = (inpainting_counts > 0).int()
+        # Create final image
+        final_img = img * (1 - mask) + inpainted_img * mask
+
+        # Do a final merge where we blur the original mask,
+        # to make blending a bit smoother
+        kernel = np.ones((5, 5), np.uint8)
+        mask = torch.Tensor(
+            cv2.dilate(mask[0, ...].float().numpy(), kernel, iterations=1)
+        ).repeat(3, 1, 1)
+        mask = functional.gaussian_blur(mask, 15)
+        final_img = img * (1 - mask) + final_img * mask
+
+        return final_img, inpainted_img, inpainting_counts
+
+
+class PatchwiseAssemble(BlendingImpl):
+    def __call__(
+        self, img: torch.Tensor, inpaintings: list[InpainingMask]
+    ) -> torch.Tensor:
+        final_img = img.clone()
+        for m in inpaintings:
+            # Don't merge full patch, but only masked part.
+            inpainted_patch = torch.where(m.mask.bool(), m.inpainted_img, m.img)
+            final_img[
+                :, m.box.ymin : m.box.ymax, m.box.xmin : m.box.xmax
+            ] = inpainted_patch
+        return final_img, None, None
+
+
+class BlendingEnum(Enum):
+    AVERAGE = AverageBlending
+    PATCHWISE = PatchwiseAssemble
+
+    def __str__(self) -> str:
+        return self.name
+
+    @staticmethod
+    def from_string(string: str) -> BlendingImpl:
+        """
+        Create a blending strategy from a string
+        """
+        try:
+            return BlendingEnum[string.upper()].value()
+        except KeyError as e:
+            raise ValueError(f"{string} is not a valid BlendingEnum") from e
+
+
+def merge_similar_masks(masks: list[InpainingMask]) -> list[InpainingMask]:
+    filtered_masks = []
+    for i, m1 in enumerate(masks):
+        keep_m1 = True
+        for j, m2 in enumerate(masks[i + 1 :]):
+            # If the two boxes overlap more than `IOU_FILTER_THRESHOLD`,
+            # keep the box whose mask has bigger area.
+
+            # FIXME: if `iou(m1, m2) > IOU_FILTER_THRESHOLD` and `iou(m2, m3) > IOU_FILTER_THRESHOLD`,
+            # but `iou(m1, m3) < IOU_FILTER_THRESHOLD`, we currently keep just m3, but we should keep also m1 or m2
+            if (
+                m1.box.iou(m2.box) > IOU_FILTER_THRESHOLD
+                and m1.mask.sum().numpy() < m2.mask.sum().numpy()
+            ):
+                keep_m1 = False
+        if keep_m1:
+            filtered_masks += [m1]
+    print(f"removed {len(masks) - len(filtered_masks)} masks")
+    return filtered_masks
+
+
+def all_images_have_same_size(
+    images: Union[list[torch.Tensor], list[BoundingBox]]
+) -> bool:
     first_size = images[0].shape
     return all([x.shape == first_size for x in images])
 
@@ -384,7 +538,7 @@ if __name__ == "__main__":
             for x in os.listdir(DATA_FOLDER)
             if is_image_file(x)
         ]
-    )[:1]
+    )[2:3]
 
     # Initialize model for object detection
     object_detection = ObjectDetection()
@@ -394,6 +548,9 @@ if __name__ == "__main__":
 
     # Initialize model for inpaining
     inpainting = Inpainting()
+
+    # How to blend inpainted patches to assemble the final image
+    blending = Blending("average", True, True)
 
     # Inference
     for i, image_path in enumerate(imgs):
@@ -419,29 +576,26 @@ if __name__ == "__main__":
         # TODO: handle shadows: identify each contiguous region in the mask, flip it vertically, shift it down, and extrude
         # To identify regions, use the original bounding boxes. Extend them by 10% to be safe, but only left/right/top, not bottom
 
-        # TODO: merge blocks with IoU above a 0.7. Keep the mask with biggest white area
+        # Merge blocks with IoU above `IOU_FILTER_THRESHOLD`.
+        # Keep the mask with biggest segmentation mask
+        masks = merge_similar_masks(masks)
+
+        # TODO: alternative strategy: merge all segmentation masks into one, then create bounding boxes over white regions
+        # Then do inpainting on these new bounding boxes. Better cause we don't have to worry about merging original boxes
 
         # Vaporize humans
         masks = inpainting(masks)
 
         # Visualize inpainted masks
-        for m in masks:
-            m.show()
+        # for m in masks:
+        #     m.show()
 
         # Assemble final image
-        final_img = img.clone()
-        for m in masks:
-            # Don't merge full patch, but only masked part.
-            # TODO: average inpainting results before updating the original image
-            inpainted_patch = torch.where(m.mask.bool(), m.inpainted_img, m.img)
-            final_img[
-                :, m.box.ymin : m.box.ymax, m.box.xmin : m.box.xmax
-            ] = inpainted_patch
-        T.ToPILImage()(final_img).show()
+        final_img = blending(img, masks)
 
         # Compute PSNR w.r.t. manually retouched image
         if os.path.basename(image_path) in os.listdir(GOLDEN_FOLDER):
             golden = T.ToTensor()(
                 Image.open(os.path.join(GOLDEN_FOLDER, os.path.basename(image_path)))
             )
-            print(f"PSNR={psnr(final_img, golden):.4f} dB")
+            print(f"PSNR={psnr(T.ToTensor()(final_img), golden):.4f} dB")

@@ -60,15 +60,15 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
                  average_generator_period=10, store_discr_outputs_for_vis=False,
                  **kwargs):
         super().__init__(*args, **kwargs)
-        LOGGER.info('BaseInpaintingTrainingModule init called')
+        # LOGGER.info('BaseInpaintingTrainingModule init called')
 
         self.config = config
 
         self.generator = make_generator(config, **self.config.generator)
         self.use_ddp = use_ddp
 
-        if not get_has_ddp_rank():
-            LOGGER.info(f'Generator\n{self.generator}')
+        # if not get_has_ddp_rank():
+        #     LOGGER.info(f'Generator\n{self.generator}')
 
         if not predict_only:
             self.save_hyperparameters(self.config)
@@ -78,8 +78,8 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
             self.val_evaluator = make_evaluator(**self.config.evaluator)
             self.test_evaluator = make_evaluator(**self.config.evaluator)
 
-            if not get_has_ddp_rank():
-                LOGGER.info(f'Discriminator\n{self.discriminator}')
+            # if not get_has_ddp_rank():
+            #     LOGGER.info(f'Discriminator\n{self.discriminator}')
 
             extra_val = self.config.data.get('extra_val', ())
             if extra_val:
@@ -112,7 +112,7 @@ class BaseInpaintingTrainingModule(ptl.LightningModule):
                 self.loss_resnet_pl = None
 
         self.visualize_each_iters = visualize_each_iters
-        LOGGER.info('BaseInpaintingTrainingModule init done')
+        # LOGGER.info('BaseInpaintingTrainingModule init done')
 
     def configure_optimizers(self):
         discriminator_params = list(self.discriminator.parameters())

@@ -44,6 +44,7 @@ class BoundingBox:
     ymax: int
     index: int
     confidence: float
+    _original_shape: tuple[int, int]
 
     def __post_init__(self) -> None:
         self.xmin = int(self.xmin)
@@ -51,6 +52,20 @@ class BoundingBox:
         self.ymin = int(self.ymin)
         self.ymax = int(self.ymax)
         self._original_box = copy(self)
+        # Ensure boxes don't go outside the original image
+        self._fix_size()
+
+    def _fix_size(self) -> "BoundingBox":
+        self.xmin = max(0, self.xmin)
+        self.xmax = min(self.xmax, self._original_shape[1])
+        self.ymin = max(0, self.ymin)
+        self.ymax = min(self.ymax, self._original_shape[0])
+        assert self.xmin >= 0
+        assert self.xmax >= 0
+        assert self.ymin >= 0
+        assert self.ymax >= 0
+        assert self.xmax > self.xmin
+        assert self.ymax > self.ymin
 
     def iou(self, other: "BoundingBox") -> float:
         # Determine the (x, y)-coordinates of the intersection rectangle
@@ -83,6 +98,8 @@ class BoundingBox:
         self.xmax += xfactor
         self.ymin -= yfactor
         self.ymax += yfactor
+        # Ensure boxes don't go outside the original image
+        self._fix_size()
         return self
 
     def to_square(self, minimum_length: int) -> "BoundingBox":
@@ -112,6 +129,9 @@ class BoundingBox:
         assert (
             self.shape[0] == self.shape[1]
         ), f"shape should be square, not {self.shape}"
+        # Ensure boxes don't go outside the original image
+        # FIXME: maybe shift the box and maintain it square
+        self._fix_size()
         return self
 
     def _to_square_fix(self):
@@ -152,7 +172,7 @@ class InpainingMask:
 
     def show(self) -> None:
         # Overlay the mask over the original picture
-        overlay = Image.new("RGB", list(self.img.shape[1:]), "red")
+        overlay = Image.new("RGB", list(self.img.shape[1:][::-1]), "red")
         image_with_overlay = T.ToPILImage()(self.img.clone())
         mask = T.ToPILImage()(self.mask * 0.3)
         image_with_overlay.paste(overlay, (0, 0), mask)
@@ -194,7 +214,15 @@ class ObjectDetection:
         # Get bounding boxes
         boxes_dataframe = results.pandas().xyxy[0]
         return [
-            BoundingBox(r["xmin"], r["xmax"], r["ymin"], r["ymax"], i, r["confidence"])
+            BoundingBox(
+                r["xmin"],
+                r["xmax"],
+                r["ymin"],
+                r["ymax"],
+                i,
+                r["confidence"],
+                img.size[::-1],
+            )
             for i, r in boxes_dataframe.iterrows()
         ]
 
@@ -218,6 +246,20 @@ class SemanticSegmentation:
         self.normalize = normalize
         self.process_in_batch = process_in_batch
 
+    # def remove_mask_at_the_border(self) -> "SemanticSegmentation":
+    #     # add 1 pixel white border all around
+    #     pad = cv2.copyMakeBorder(gray, 1,1,1,1, cv2.BORDER_CONSTANT, value=255)
+    #     h, w = pad.shape
+
+    #     # create zeros mask 2 pixels larger in each dimension
+    #     mask = np.zeros([h + 2, w + 2], np.uint8)
+
+    #     # floodfill outer white border with black
+    #     img_floodfill = cv2.floodFill(pad, mask, (0,0), 0, (5), (0), flags=8)[1]
+
+    #     # remove border
+    #     img_floodfill = img_floodfill[1:h-1, 1:w-1]
+
     def __call__(
         self,
         img: Union[torch.Tensor, Image.Image],
@@ -228,6 +270,7 @@ class SemanticSegmentation:
         ) -> TensorType["H", "W"]:
             with torch.no_grad():
                 prediction = self.model(batch)["out"]
+
                 prediction = prediction.softmax(dim=1)
                 mask = (
                     prediction[:, SemanticSegmentation.PERSON_INDEX_IN_COCO, ...]
@@ -245,13 +288,6 @@ class SemanticSegmentation:
             )
         else:
             _img = img.clone()
-        # Extract crops from the image
-        if bounding_boxes is not None and all_images_have_same_size(bounding_boxes):
-            crops = [_img[:, b.ymin : b.ymax, b.xmin : b.xmax] for b in bounding_boxes]
-            batch = torch.stack(crops, dim=0)
-        else:
-            # Turn the input into a batch
-            batch = _img.unsqueeze(0)
 
         # Predict the segmentation mask
         if bounding_boxes is None:
@@ -262,7 +298,7 @@ class SemanticSegmentation:
             bounding_boxes = [None]
         else:
             crops = [_img[:, b.ymin : b.ymax, b.xmin : b.xmax] for b in bounding_boxes]
-            if self.process_in_batch and all_images_have_same_size(bounding_boxes):
+            if self.process_in_batch and all_images_have_same_size(crops):
                 # Case 2: process all images in a single batch, if they have the same size
                 batch = torch.stack(crops, dim=0)
                 masks = torch.unbind(_inner_computation(batch))
@@ -320,7 +356,7 @@ class Inpainting:
             height, width = img.shape[-2:]
             out_height = _ceil_modulo(height, modulo)
             out_width = _ceil_modulo(width, modulo)
-            padded_shape = [0, 0, out_height - height, out_width - width]
+            padded_shape = [0, 0, out_width - width, out_height - height]
             take_first_dim = False
             if len(img.shape) == 2:
                 img = img.unsqueeze(dim=0)
@@ -538,7 +574,7 @@ if __name__ == "__main__":
             for x in os.listdir(DATA_FOLDER)
             if is_image_file(x)
         ]
-    )[2:3]
+    )[6:]
 
     # Initialize model for object detection
     object_detection = ObjectDetection()
@@ -558,7 +594,7 @@ if __name__ == "__main__":
         # Get bounding boxes of humans
         boxes = object_detection(image_path)
 
-        # Increase each box by 10%, then make it square (and at least 224x224 in size)
+        # Increase each box by 50%, then make it square (and at least 224x224 in size)
         for b in boxes:
             b.scale(BOUNDING_BOX_INCREASE_FACTOR).to_square(BOUNDING_BOX_MIN_SIZE)
 
@@ -575,6 +611,7 @@ if __name__ == "__main__":
 
         # TODO: handle shadows: identify each contiguous region in the mask, flip it vertically, shift it down, and extrude
         # To identify regions, use the original bounding boxes. Extend them by 10% to be safe, but only left/right/top, not bottom
+        # TODO: rotate all boxes around bottom, starting from 60-60 angle. Look for min average brightness, that's probably the shadow angle
 
         # Merge blocks with IoU above `IOU_FILTER_THRESHOLD`.
         # Keep the mask with biggest segmentation mask

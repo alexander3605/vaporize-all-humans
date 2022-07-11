@@ -1,5 +1,8 @@
 from typing import TypeVar, Any, Callable
 from functools import wraps
+from torchtyping import TensorType
+import torch
+import numpy as np
 import time
 
 
@@ -42,5 +45,20 @@ def timeit(name: str = ""):
             function_name = name if name else f.__name__
             print(f"function: {function_name}, time: {e - s:.2f} sec")
             return result
+
         return wrap
+
     return _timeit
+
+
+def psnr(
+    x: TensorType["C", "H", "W", float],
+    y: TensorType["C", "H", "W", float],
+    peak: float = 255,
+):
+    return 10 * np.log10(peak**2 / torch.mean((x - y) ** 2).numpy())
+
+
+def all_tensors_have_same_shape(images: list[torch.Tensor]) -> bool:
+    first_size = images[0].shape
+    return all([x.shape == first_size for x in images])

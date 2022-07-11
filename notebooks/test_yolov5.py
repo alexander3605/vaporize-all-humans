@@ -24,7 +24,7 @@ from enum import Enum
 
 from dataclasses import dataclass
 from torchvision.models.segmentation import fcn_resnet50
-from vaporize_all_humans.utils import is_image_file, timeit, F, C, H, W
+from vaporize_all_humans.utils import is_image_file, timeit, all_tensors_have_same_shape, psnr, F, C, H, W
 from external.lama.saicinpainting.training.trainers.default import (
     DefaultInpaintingTrainingModule,
 )
@@ -32,10 +32,10 @@ from external.lama.saicinpainting.training.trainers.default import (
 DATA_FOLDER = "data/samples"
 GOLDEN_FOLDER = os.path.join(DATA_FOLDER, "golden")
 BOUNDING_BOX_INCREASE_FACTOR = 0.5
-BOUNDING_BOX_MIN_SIZE = 512
+BOUNDING_BOX_MIN_SIZE = 224
 IOU_FILTER_THRESHOLD = 0.5
 GAUSSIAN_BLUR_ON_MERGE = False
-
+CONDENSE_SEGMENTATION_MASKS = True
 
 @dataclass
 class BoundingBox:
@@ -165,6 +165,12 @@ class InpainingMask:
     mask: TensorType["H", "W", float]
     inpainted_img: TensorType["C", "H", "W", float] = None
 
+    def __post_init__(self) -> None:
+        assert self.box.shape == self.img.shape[-2:], f"{self.box.shape=} != {self.img.shape[-2:]=}"
+        assert self.mask.shape == self.img.shape[-2:], f"{self.mask.shape=} != {self.img.shape[-2:]=}"
+        if self.inpainted_img is not None:
+            assert self.inpainted_img.shape == self.img.shape, f"{self.inpainted_img.shape=} != {self.img.shape=}"
+
     def remove_mask_at_the_border(self) -> "SemanticSegmentation":
         # Add 1 pixel of white border around the mask
         padding = cv2.copyMakeBorder(
@@ -185,10 +191,14 @@ class InpainingMask:
         return self
 
     def opening(self, erode: int = 2, dilate: int = 15) -> "InpainingMask":
-        kernel = np.ones((erode, erode), np.uint8)
-        mask = cv2.erode(self.mask.numpy(), kernel, iterations=1)
-        kernel = np.ones((dilate, dilate), np.uint8)
-        self.mask = torch.Tensor(cv2.dilate(mask, kernel, iterations=1))
+        mask = self.mask.numpy()
+        if erode > 0:
+            kernel = np.ones((erode, erode), np.uint8)
+            mask = cv2.erode(mask, kernel, iterations=1)
+        if dilate > 0:
+            kernel = np.ones((dilate, dilate), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=1)
+        self.mask = torch.Tensor(mask)
         return self
 
     def show(self) -> None:
@@ -213,11 +223,15 @@ class InpainingMask:
 
 
 class ObjectDetection:
+
+    CHECKPOINT_PATH = "checkpoints/yolov5s.pt"
+
     def __init__(self, threshold: float = 0.5) -> None:
         # Download the model (this will be cached for future reuse)
         self.model = torch.hub.load(
             "ultralytics/yolov5", "yolov5s", pretrained=True, verbose=False
         )
+        # self.model = torch.load(ObjectDetection.CHECKPOINT_PATH)
         # Only detect persons
         self.model.classes = [0]
         # Somewhat low confidence, to detect small persons
@@ -307,7 +321,7 @@ class SemanticSegmentation:
             bounding_boxes = [None]
         else:
             crops = [_img[:, b.ymin : b.ymax, b.xmin : b.xmax] for b in bounding_boxes]
-            if self.process_in_batch and all_images_have_same_size(crops):
+            if self.process_in_batch and all_tensors_have_same_shape(crops):
                 # Case 2: process all images in a single batch, if they have the same size
                 batch = torch.stack(crops, dim=0)
                 masks = torch.unbind(_inner_computation(batch))
@@ -318,7 +332,7 @@ class SemanticSegmentation:
         # Assemble the predicted mask(s) into a list of `InpainingMask`
         return [
             InpainingMask(box, img[:, box.ymin : box.ymax, box.xmin : box.xmax], mask)
-            for (box, mask) in zip(boxes, masks)
+            for (box, mask) in zip(bounding_boxes, masks)
         ]
 
 
@@ -407,11 +421,10 @@ class Inpainting:
 
     @timeit("inpainting")
     def __call__(self, inpaintings: list[InpainingMask]) -> list[InpainingMask]:
-
         with torch.no_grad():
             # Use a single batch if images have the same size and a flag has been specified
             # If not, process them one by one
-            if self.process_in_batch and all_images_have_same_size(
+            if self.process_in_batch and all_tensors_have_same_shape(
                 [x.img for x in inpaintings]
             ):
                 inpaintings = self._inner_computation(inpaintings)
@@ -539,45 +552,154 @@ class BlendingEnum(Enum):
             return BlendingEnum[string.upper()].value()
         except KeyError as e:
             raise ValueError(f"{string} is not a valid BlendingEnum") from e
+            
+    
+class Vaporizer:
 
+    def __init__(self) -> None:
+        # Initialize model for object detection
+        self.object_detection = ObjectDetection()
+        # Initialize model for semanting segmentation
+        self.semanting_segmentation = SemanticSegmentation()
+        # Initialize model for inpaining
+        self.inpainting = Inpainting()
+        # How to blend inpainted patches to assemble the final image
+        self.blending = Blending("average", True, True)
+        
+    @timeit()
+    def _merge_similar_masks(self, masks: list[InpainingMask]) -> list[InpainingMask]:
+        filtered_masks = []
+        for i, m1 in enumerate(masks):
+            keep_m1 = True
+            for m2 in masks[i + 1 :]:
+                # If the two boxes overlap more than `IOU_FILTER_THRESHOLD`,
+                # keep the box whose mask has bigger area.
+    
+                # FIXME: if `iou(m1, m2) > IOU_FILTER_THRESHOLD` and `iou(m2, m3) > IOU_FILTER_THRESHOLD`,
+                # but `iou(m1, m3) < IOU_FILTER_THRESHOLD`, we currently keep just m3, but we should keep also m1 or m2
+                if (
+                    m1.box.iou(m2.box) > IOU_FILTER_THRESHOLD
+                    and m1.mask.sum().numpy() < m2.mask.sum().numpy()
+                ):
+                    keep_m1 = False
+            if keep_m1:
+                filtered_masks += [m1]
+        print(f"removed {len(masks) - len(filtered_masks)} masks")
+        return filtered_masks
+        
+    def __call__(self, image: Union[str, list[str]]) -> None:
+        # Process a list of image paths
+        if isinstance(image, str):
+            image = [image]
+        result = {}
+        for image_path in image:
+            # Get bounding boxes of humans
+            boxes = self.object_detection(image_path)
 
-@timeit()
-def merge_similar_masks(masks: list[InpainingMask]) -> list[InpainingMask]:
-    filtered_masks = []
-    for i, m1 in enumerate(masks):
-        keep_m1 = True
-        for j, m2 in enumerate(masks[i + 1 :]):
-            # If the two boxes overlap more than `IOU_FILTER_THRESHOLD`,
-            # keep the box whose mask has bigger area.
+            # Increase each box by 50%, then make it square (and at least 224x224 in size)
+            for b in boxes:
+                b.scale(BOUNDING_BOX_INCREASE_FACTOR).to_square(BOUNDING_BOX_MIN_SIZE)
 
-            # FIXME: if `iou(m1, m2) > IOU_FILTER_THRESHOLD` and `iou(m2, m3) > IOU_FILTER_THRESHOLD`,
-            # but `iou(m1, m3) < IOU_FILTER_THRESHOLD`, we currently keep just m3, but we should keep also m1 or m2
-            if (
-                m1.box.iou(m2.box) > IOU_FILTER_THRESHOLD
-                and m1.mask.sum().numpy() < m2.mask.sum().numpy()
-            ):
-                keep_m1 = False
-        if keep_m1:
-            filtered_masks += [m1]
-    print(f"removed {len(masks) - len(filtered_masks)} masks")
-    return filtered_masks
+            # Semanting segmentation on each bounding box, create segmentation mask for humans
+            img = Image.open(image_path)
+            img = T.ToTensor()(img)
+            masks = self.semanting_segmentation(img, boxes)
 
+            # Clean and expand segmentation masks, to improve inpainting
+            # Also remove any segmentation mask that touches the border
+            masks = self._clean_masks(masks)
 
-def all_images_have_same_size(
-    images: Union[list[torch.Tensor], list[BoundingBox]]
-) -> bool:
-    first_size = images[0].shape
-    return all([x.shape == first_size for x in images])
+            # TODO: handle shadows: identify each contiguous region in the mask, flip it vertically, shift it down, and extrude
+            # To identify regions, use the original bounding boxes. Extend them by 10% to be safe, but only left/right/top, not bottom
+            # TODO: rotate all boxes around bottom, starting from 60-60 angle. Look for min average brightness, that's probably the shadow angle
 
+            # Merge blocks with IoU above `IOU_FILTER_THRESHOLD`.
+            # Keep the mask with biggest segmentation mask
+            masks = self._merge_similar_masks(masks)
 
-def psnr(
-    x: TensorType["C", "H", "W", float],
-    y: TensorType["C", "H", "W", float],
-    peak: float = 255,
-):
-    return 10 * np.log10(peak**2 / torch.mean((x - y) ** 2).numpy())
+            # Merge all segmentation masks into one, then create bounding boxes over white regions
+            # Then do inpainting on these new bounding boxes.
+            # Better cause we don't have to worry about merging original boxes
+            if CONDENSE_SEGMENTATION_MASKS:
+                masks = self._create_condensed_masks(img, masks)
 
+            # Vaporize humans
+            masks = self.inpainting(masks)
 
+            # Visualize inpainted masks
+            # for m in masks:
+            #     m.show()
+
+            # Assemble final image
+            final_img = self.blending(img, masks)
+
+            # Compute PSNR w.r.t. manually retouched image
+            if os.path.basename(image_path) in os.listdir(GOLDEN_FOLDER):
+                golden = T.ToTensor()(
+                    Image.open(os.path.join(GOLDEN_FOLDER, os.path.basename(image_path)))
+                )
+                print(f"PSNR={psnr(T.ToTensor()(final_img), golden):.4f} dB")
+            result[image_path] = {"inpaintings": masks, "final_image": final_img, "original_image": img}
+        return result
+    
+    @timeit()
+    def _clean_masks(self, masks: list[InpainingMask], erode: int = 2, dilate: int = 15) -> list[InpainingMask]:
+        """
+        Remove segmentation masks that touch the border of the box,
+          as it creates artifacts when merging.
+        Then slightly contract masks to clean small noisy spots,
+          and expand the masks to cover a area bigger than the precise
+          human contour, as it improves inpainting
+        """
+        for m in masks:
+            m.remove_mask_at_the_border()
+            m.opening(erode=erode, dilate=dilate)
+        # Remove masks that no longer have any segmentation in them
+        return [m for m in masks if m.mask.sum() > 0]
+
+    @timeit()
+    def _create_condensed_masks(self, img: torch.Tensor, masks: list[InpainingMask]) -> list[InpainingMask]:
+        """
+        Merge all segmentation masks into one, 
+          then create bounding boxes over white regions.
+        Then do inpainting on these new bounding boxes. 
+        This procedure creates better inpainting masks, 
+          by merging masks of humans close to each other
+        """
+       
+        # First, merge all segmentation masks into a unique mask
+        total_mask = torch.zeros(img.shape).bool()[0, ...]
+        for m in masks:
+            # Don't merge the full patch, but only the masked parts
+            total_mask[
+                m.box.ymin : m.box.ymax, m.box.xmin : m.box.xmax
+            ] |= m.mask.bool()
+        total_mask = total_mask.float()
+        total_mask_byte = (total_mask * 255).byte().numpy()
+            
+        # Compute bounding boxes over this mask
+        contours = cv2.findContours(total_mask_byte, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours = contours[0] if len(contours) == 2 else contours[1]
+        boxes = []
+        for i, c in enumerate(contours):
+            x, y, w, h = cv2.boundingRect(c)
+            boxes += [BoundingBox(x, x + w, y, y + h, i, 1, list(total_mask_byte.shape))]
+        # Increase size of bounding boxes
+        for b in boxes:
+            b.scale(BOUNDING_BOX_INCREASE_FACTOR).to_square(BOUNDING_BOX_MIN_SIZE)
+            
+        # Create new segmentation masks
+        new_masks = []
+        for b in boxes:
+            img_patch = img[:, b.ymin : b.ymax, b.xmin : b.xmax]
+            mask = total_mask[b.ymin : b.ymax, b.xmin : b.xmax]
+            new_masks += [InpainingMask(b, img_patch, mask, None)]
+            
+        # Do a final filtering step to remove unnecessary masks
+        new_masks = self._merge_similar_masks(new_masks)
+        return new_masks
+    
+   
 #%% Vaporize humans
 if __name__ == "__main__":
 
@@ -589,68 +711,9 @@ if __name__ == "__main__":
             if is_image_file(x)
         ]
     )[2:3]
-
-    # Initialize model for object detection
-    object_detection = ObjectDetection()
-
-    # Initialize model for semanting segmentation
-    semanting_segmentation = SemanticSegmentation()
-
-    # Initialize model for inpaining
-    inpainting = Inpainting()
-
-    # How to blend inpainted patches to assemble the final image
-    blending = Blending("average", True, True)
-
+    
     # Inference
-    for i, image_path in enumerate(imgs):
+    vaporizer = Vaporizer()
+    result = vaporizer(imgs)
 
-        # Get bounding boxes of humans
-        boxes = object_detection(image_path)
-
-        # Increase each box by 50%, then make it square (and at least 224x224 in size)
-        for b in boxes:
-            b.scale(BOUNDING_BOX_INCREASE_FACTOR).to_square(BOUNDING_BOX_MIN_SIZE)
-
-        # Semanting segmentation on each bounding box, create segmentation mask for humans
-        img = Image.open(image_path)
-        img = T.ToTensor()(img)
-        masks = semanting_segmentation(img, boxes)
-
-        # Clean and expand segmentation masks, to improve inpainting
-        # Also remove any segmentation mask that touches the border
-        # https://stackoverflow.com/questions/65534370/remove-the-element-attached-to-the-image-border
-        for m in masks:
-            m.remove_mask_at_the_border()
-            m.opening()
-        # Remove masks that no longer have any segmentation in them
-        masks = [m for m in masks if m.mask.sum() > 0]
-
-        # TODO: handle shadows: identify each contiguous region in the mask, flip it vertically, shift it down, and extrude
-        # To identify regions, use the original bounding boxes. Extend them by 10% to be safe, but only left/right/top, not bottom
-        # TODO: rotate all boxes around bottom, starting from 60-60 angle. Look for min average brightness, that's probably the shadow angle
-
-        # Merge blocks with IoU above `IOU_FILTER_THRESHOLD`.
-        # Keep the mask with biggest segmentation mask
-        masks = merge_similar_masks(masks)
-
-        # TODO: alternative strategy: merge all segmentation masks into one, then create bounding boxes over white regions
-        # Then do inpainting on these new bounding boxes. Better cause we don't have to worry about merging original boxes
-        # https://stackoverflow.com/questions/63923800/drawing-bounding-rectangles-around-multiple-objects-in-binary-image-in-python
-
-        # Vaporize humans
-        masks = inpainting(masks)
-
-        # Visualize inpainted masks
-        # for m in masks:
-        #     m.show()
-
-        # Assemble final image
-        final_img = blending(img, masks)
-
-        # Compute PSNR w.r.t. manually retouched image
-        if os.path.basename(image_path) in os.listdir(GOLDEN_FOLDER):
-            golden = T.ToTensor()(
-                Image.open(os.path.join(GOLDEN_FOLDER, os.path.basename(image_path)))
-            )
-            print(f"PSNR={psnr(T.ToTensor()(final_img), golden):.4f} dB")
+       

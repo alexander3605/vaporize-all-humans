@@ -1,6 +1,6 @@
 # VAPORIZE ALL HUMANS! :gun: :alien:
 
-![Vaporizer in action!](https://github.com/AlbertoParravicini/vaporize-all-humans/tree/master/data/gif/vaporizer.gif)
+![Vaporizer in action!](https://github.com/AlbertoParravicini/vaporize-all-humans/blob/master/data/gif/vaporizer.gif)
 
 ```
 conda create --name human_vaporizer

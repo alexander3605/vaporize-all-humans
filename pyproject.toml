@@ -12,6 +12,7 @@ opencv-python = "^4.6.0"
 black = "^22.6.0"
 torchtyping = "^0.1.4"
 webdataset = "^0.2.5"
+isort = "^5.10.1"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"

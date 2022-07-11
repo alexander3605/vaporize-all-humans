@@ -1,10 +1,10 @@
-from typing import TypeVar, Any, Callable
-from functools import wraps
-from torchtyping import TensorType
-import torch
-import numpy as np
 import time
+from functools import wraps
+from typing import Any, Callable, TypeVar
 
+import numpy as np
+import torch
+from torchtyping import TensorType
 
 F = TypeVar("F")  # Frames
 C = TypeVar("C")  # Channels

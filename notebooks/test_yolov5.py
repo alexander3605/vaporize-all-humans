@@ -19,7 +19,7 @@ import yaml
 import cv2
 from torchvision.utils import make_grid
 from copy import copy
-from abc import abstractmethod
+from abc import abstractmethod, ABC
 from enum import Enum
 
 from dataclasses import dataclass
@@ -161,17 +161,19 @@ class BoundingBox:
 @dataclass
 class InpainingMask:
     box: BoundingBox
-    img: TensorType["C", "H", "W", float]
-    mask: TensorType["H", "W", float]
-    inpainted_img: TensorType["C", "H", "W", float] = None
+    image: TensorType["C", "H", "W", float]
+    mask: TensorType["H", "W", float] = None
+    inpainted_image: TensorType["C", "H", "W", float] = None
 
     def __post_init__(self) -> None:
-        assert self.box.shape == self.img.shape[-2:], f"{self.box.shape=} != {self.img.shape[-2:]=}"
-        assert self.mask.shape == self.img.shape[-2:], f"{self.mask.shape=} != {self.img.shape[-2:]=}"
-        if self.inpainted_img is not None:
-            assert self.inpainted_img.shape == self.img.shape, f"{self.inpainted_img.shape=} != {self.img.shape=}"
+        assert self.box.shape == self.image.shape[-2:], f"{self.box.shape=} != {self.image.shape[-2:]=}"
+        if self.mask is not None:
+            assert self.mask.shape == self.image.shape[-2:], f"{self.mask.shape=} != {self.image.shape[-2:]=}"
+        if self.inpainted_image is not None:
+            assert self.inpainted_image.shape == self.image.shape, f"{self.inpainted_image.shape=} != {self.image.shape=}"
 
     def remove_mask_at_the_border(self) -> "SemanticSegmentation":
+        assert self.mask is not None, "mask cannot be None"
         # Add 1 pixel of white border around the mask
         padding = cv2.copyMakeBorder(
             self.mask.numpy(), 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=1
@@ -191,6 +193,7 @@ class InpainingMask:
         return self
 
     def opening(self, erode: int = 2, dilate: int = 15) -> "InpainingMask":
+        assert self.mask is not None, "mask cannot be None"
         mask = self.mask.numpy()
         if erode > 0:
             kernel = np.ones((erode, erode), np.uint8)
@@ -202,54 +205,72 @@ class InpainingMask:
         return self
 
     def show(self) -> None:
+        assert self.mask is not None, "mask cannot be None"
         # Overlay the mask over the original picture
-        overlay = Image.new("RGB", list(self.img.shape[1:][::-1]), "red")
-        image_with_overlay = T.ToPILImage()(self.img.clone())
+        overlay = Image.new("RGB", list(self.image.shape[1:][::-1]), "red")
+        image_with_overlay = T.ToPILImage()(self.image.clone())
         mask = T.ToPILImage()(self.mask * 0.3)
         image_with_overlay.paste(overlay, (0, 0), mask)
-        # image_with_overlay = T.ToTensor()(Image.composite(original_img, overlay, mask).convert("RGB"))
+        # image_with_overlay = T.ToTensor()(Image.composite(original_image, overlay, mask).convert("RGB"))
         image_with_overlay = T.ToTensor()(image_with_overlay.convert("RGB"))
         # Stack all images into a grid
         images_stacked = [
-            self.img,
+            self.image,
             self.mask.unsqueeze(0).repeat(3, 1, 1),
             image_with_overlay,
         ]
         # Show inpainting result if available
-        if self.inpainted_img is not None:
-            images_stacked += [self.inpainted_img]
+        if self.inpainted_image is not None:
+            images_stacked += [self.inpainted_image]
         grid = make_grid(images_stacked, nrow=len(images_stacked), padding=0)
         T.ToPILImage()(grid).show()
 
+@dataclass
+class VaporizerStage(ABC):
+    def __call__(
+        self,
+        image: Optional[TensorType["C", "H", "W"]] = None,
+        inpainting_masks: Optional[list[InpainingMask]] = None
+    ) -> list[InpainingMask]:
+        pass
 
-class ObjectDetection:
+
+@dataclass
+class ObjectDetection(VaporizerStage):
 
     CHECKPOINT_PATH = "checkpoints/yolov5s.pt"
+    threshold: float = 0.5
 
-    def __init__(self, threshold: float = 0.5) -> None:
+    def __post_init__(self) -> None:
         # Download the model (this will be cached for future reuse)
         self.model = torch.hub.load(
             "ultralytics/yolov5", "yolov5s", pretrained=True, verbose=False
         )
-        # self.model = torch.load(ObjectDetection.CHECKPOINT_PATH)
         # Only detect persons
         self.model.classes = [0]
         # Somewhat low confidence, to detect small persons
-        self.model.conf = threshold
+        self.model.conf = self.threshold
         # Smaller IoU threhsold
         self.model.iou = 0.7
 
+    def _initialize_segmentation_masks(self, image: TensorType["C", "H", "W"], boxes: list[BoundingBox]) -> list[InpainingMask]:
+        return [InpainingMask(b, image[:, b.ymin : b.ymax, b.xmin : b.xmax], None, None) for b in boxes]
+
     @timeit("object detection")
-    def __call__(self, img_path: str) -> list[BoundingBox]:
-        # Read the image to obtain its shape,
-        # we want to do object detection at high resolution to be more accurate
-        img = Image.open(img_path)
-        # Predict bounding boxes of people
+    def __call__(
+        self,
+        image: Optional[TensorType["C", "H", "W"]] = None,
+        inpainting_masks: Optional[list[InpainingMask]] = None
+    ) -> list[InpainingMask]:
+        # Predict bounding boxes of people.
+        # We do object detection at full resolution to detect all those small pesky humans
         with torch.no_grad():
-            results = self.model(img_path, size=img.size[0])
+            # This model requires a HWC numpy matrix to return a dataframe,
+            # otherwise it returns a tensor
+            results = self.model(np.array(T.ToPILImage()(image)), size=image.shape[-1])
         # Get bounding boxes
         boxes_dataframe = results.pandas().xyxy[0]
-        return [
+        boxes = [
             BoundingBox(
                 r["xmin"],
                 r["xmax"],
@@ -257,93 +278,86 @@ class ObjectDetection:
                 r["ymax"],
                 i,
                 r["confidence"],
-                img.size[::-1],
+                image.shape[-2:],
             )
             for i, r in boxes_dataframe.iterrows()
         ]
+        # Initialize segmentation masks
+        return self._initialize_segmentation_masks(image, boxes)
 
 
-class SemanticSegmentation:
+@dataclass
+class SemanticSegmentation(VaporizerStage):
 
     # Class index of `person`, in COCO.
     # Reference: https://pytorch.org/vision/0.11/models.html#semantic-segmentation
     PERSON_INDEX_IN_COCO = 15
 
-    def __init__(
-        self,
-        threshold: float = 0.5,
-        normalize: bool = True,
-        process_in_batch: bool = True,
-    ):
+    threshold: float = 0.5
+    normalize: bool = True
+    process_in_batch: bool = True
+
+    def __post_init__(self):
         # Initialize semanting segmentation model
         self.model = fcn_resnet50(pretrained=True)
         self.model.eval()
-        self.threshold = threshold
-        self.normalize = normalize
-        self.process_in_batch = process_in_batch
+
+    def _inner_computation(
+        self,
+        batch: TensorType["F", "C", "H", "W"]
+    ) -> TensorType["H", "W"]:
+        with torch.no_grad():
+            prediction = self.model(batch)["out"]
+
+            prediction = prediction.softmax(dim=1)
+            mask = (
+                prediction[:, SemanticSegmentation.PERSON_INDEX_IN_COCO, ...]
+                > self.threshold
+            ).float()
+            return mask
 
     @timeit("segmentation")
     def __call__(
         self,
-        img: Union[torch.Tensor, Image.Image],
-        bounding_boxes: Optional[list[BoundingBox]] = None,
+        image: Optional[TensorType["C", "H", "W"]] = None,
+        inpainting_masks: Optional[list[InpainingMask]] = None
     ) -> list[InpainingMask]:
-        def _inner_computation(
-            batch: TensorType["F", "C", "H", "W"]
-        ) -> TensorType["H", "W"]:
-            with torch.no_grad():
-                prediction = self.model(batch)["out"]
-
-                prediction = prediction.softmax(dim=1)
-                mask = (
-                    prediction[:, SemanticSegmentation.PERSON_INDEX_IN_COCO, ...]
-                    > self.threshold
-                ).float()
-                return mask
-
-        # Ensure we are dealing with a tensor
-        if isinstance(img, Image.Image):
-            img = T.ToTensor()(img)
         # Normalize image
         if self.normalize:
-            _img = functional.normalize(
-                img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=False
+            _image = functional.normalize(
+                image, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=False
             )
         else:
-            _img = img.clone()
+            _image = image.clone()
 
         # Predict the segmentation mask
-        if bounding_boxes is None:
-            # Case 1: just a single image
-            batch = _img.unsqueeze(0)
-            masks = [_inner_computation(batch)[0]]
-            # No bounding box is present in this case
-            bounding_boxes = [None]
+        bounding_boxes = [m.box for m in inpainting_masks]
+        crops = [_image[:, b.ymin : b.ymax, b.xmin : b.xmax] for b in bounding_boxes]
+        if self.process_in_batch and all_tensors_have_same_shape(crops):
+            # Case 2: process all images in a single batch, if they have the same size
+            batch = torch.stack(crops, dim=0)
+            segmentation_masks = torch.unbind(self._inner_computation(batch))
         else:
-            crops = [_img[:, b.ymin : b.ymax, b.xmin : b.xmax] for b in bounding_boxes]
-            if self.process_in_batch and all_tensors_have_same_shape(crops):
-                # Case 2: process all images in a single batch, if they have the same size
-                batch = torch.stack(crops, dim=0)
-                masks = torch.unbind(_inner_computation(batch))
-            else:
-                # Case 3: process images individually, if they have different sizes
-                masks = [_inner_computation(c.unsqueeze(dim=0))[0] for c in crops]
+            # Case 3: process images individually, if they have different sizes
+            segmentation_masks = [self._inner_computation(c.unsqueeze(dim=0))[0] for c in crops]
 
         # Assemble the predicted mask(s) into a list of `InpainingMask`
-        return [
-            InpainingMask(box, img[:, box.ymin : box.ymax, box.xmin : box.xmax], mask)
-            for (box, mask) in zip(bounding_boxes, masks)
-        ]
+        for m, sm in zip(inpainting_masks, segmentation_masks):
+            m.mask = sm
+        return inpainting_masks
 
 
-class Inpainting:
+@dataclass
+class Inpainting(VaporizerStage):
 
     LAMA_CONFIG_DIR = "external/lama/big-lama"
     # LAMA_CONFIG_DIR = "external/lama/LaMa_models/lama-places/lama-fourier"
     LAMA_CHECKPOINT = "best.ckpt"
     PAD_TO_MODULO = 8
 
-    def __init__(self, process_in_batch: bool = True):
+    process_in_batch: bool = True
+
+    def __post_init__(self):
 
         train_config_path = os.path.join(Inpainting.LAMA_CONFIG_DIR, "config.yaml")
         with open(train_config_path, "r") as f:
@@ -355,7 +369,6 @@ class Inpainting:
             )
             self.model = self._load_checkpoint(train_config, checkpoint_path)
         self.model.freeze()
-        self.process_in_batch = process_in_batch
 
     def _load_checkpoint(
         self, train_config, checkpoint_path, map_location="cpu", strict=False
@@ -374,40 +387,40 @@ class Inpainting:
             return x
         return (x // mod + 1) * mod
 
-    def _pad_img_to_modulo(self, img: torch.Tensor, modulo: int):
-        height, width = img.shape[-2:]
+    def _pad_image_to_modulo(self, image: torch.Tensor, modulo: int):
+        height, width = image.shape[-2:]
         out_height = self._ceil_modulo(height, modulo)
         out_width = self._ceil_modulo(width, modulo)
         padded_shape = [0, 0, out_width - width, out_height - height]
         take_first_dim = False
-        if len(img.shape) == 2:
-            img = img.unsqueeze(dim=0)
+        if len(image.shape) == 2:
+            image = image.unsqueeze(dim=0)
             take_first_dim = True
-        img = functional.pad(img, padded_shape, padding_mode="symmetric")
+        image = functional.pad(image, padded_shape, padding_mode="symmetric")
         if take_first_dim:
-            img = img[0]
-        return img
+            image = image[0]
+        return image
 
-    def _inner_computation(self, inpaintings: list[InpainingMask]) -> list[InpainingMask]:
-        imgs = []
+    def _inner_computation(self, inpainting_masks: list[InpainingMask]) -> list[InpainingMask]:
+        images = []
         masks = []
         # Used to restore the original image shape
         original_image_size = None
-        for x in inpaintings:
+        for x in inpainting_masks:
             # Process each image to create a batch
             if Inpainting.PAD_TO_MODULO > 0:
-                original_image_size = x.img.shape[1:]
-                img = self._pad_img_to_modulo(x.img, Inpainting.PAD_TO_MODULO)
-                mask = self._pad_img_to_modulo(x.mask, Inpainting.PAD_TO_MODULO)
+                original_image_size = x.image.shape[1:]
+                image = self._pad_image_to_modulo(x.image, Inpainting.PAD_TO_MODULO)
+                mask = self._pad_image_to_modulo(x.mask, Inpainting.PAD_TO_MODULO)
             else:
-                img = x.img
+                image = x.image
                 mask = x.mask
-            imgs += [img]
+            images += [image]
             masks += [mask.unsqueeze(dim=0)]
         # Assemble the batch
-        imgs = torch.stack(imgs, dim=0)
+        images = torch.stack(images, dim=0)
         masks = torch.stack(masks, dim=0)
-        batch = {"image": imgs, "mask": masks}
+        batch = {"image": images, "mask": masks}
         # Compute inpainting
         batch = self.model(batch)
         # Retrieve the result, and ensure it has the correct size
@@ -415,83 +428,93 @@ class Inpainting:
         if original_image_size is not None:
             original_height, original_width = original_image_size
             inpainted = inpainted[..., :original_height, :original_width]
-        for i, x in enumerate(inpaintings):
-            x.inpainted_img = inpainted[i, ...]
-        return inpaintings
+        for i, x in enumerate(inpainting_masks):
+            x.inpainted_image = inpainted[i, ...]
+        return inpainting_masks
 
     @timeit("inpainting")
-    def __call__(self, inpaintings: list[InpainingMask]) -> list[InpainingMask]:
+    def __call__(
+        self,
+        image: Optional[TensorType["C", "H", "W"]] = None,
+        inpainting_masks: Optional[list[InpainingMask]] = None
+    ) -> list[InpainingMask]:
         with torch.no_grad():
             # Use a single batch if images have the same size and a flag has been specified
             # If not, process them one by one
             if self.process_in_batch and all_tensors_have_same_shape(
-                [x.img for x in inpaintings]
+                [x.image for x in inpainting_masks]
             ):
-                inpaintings = self._inner_computation(inpaintings)
+                inpainting_masks = self._inner_computation(inpainting_masks)
             else:
                 # Process images independently
-                inpaintings = [self._inner_computation([x])[0] for x in inpaintings]
-            return inpaintings
+                inpainting_masks = [self._inner_computation([x])[0] for x in inpainting_masks]
+            return inpainting_masks
 
 
-class Blending:
-    def __init__(
-        self,
-        method: str = "average",
-        show_inpainted_image: bool = False,
-        show_inpainting_mask: bool = False,
-    ) -> None:
-        self._method = BlendingEnum.from_string(method)
-        self.show_inpainted_image = show_inpainted_image
-        self.show_inpainting_mask = show_inpainting_mask
+@dataclass
+class Blending(VaporizerStage):
+
+    method: str = "average"
+    show_inpainted_image: bool = False
+    show_inpainting_mask: bool = False
+
+    def __post_init__(self) -> None:
+        self._blending_impl = BlendingEnum.from_string(self.method)
+        self._output: Optional[TensorType["C", "H", "W"]] = None
 
     @timeit("blending")
     def __call__(
-        self, img: Union[torch.Tensor, Image.Image], inpaintings: list[InpainingMask]
-    ) -> Image.Image:
-        # Ensure we are dealing with a tensor
-        if isinstance(img, Image.Image):
-            img = T.ToTensor()(img)
-        final_img, inpainted_img, inpainting_counts = self._method(img, inpaintings)
-        final_img = T.ToPILImage()(final_img)
+        self,
+        image: Optional[TensorType["C", "H", "W"]] = None,
+        inpainting_masks: Optional[list[InpainingMask]] = None
+    ) -> list[InpainingMask]:       
+        self._output, inpainted_image, inpainting_counts = self._blending_impl(image, inpainting_masks)
+        _final_image = T.ToPILImage()(self._output)
         # Visualize blending results
         if (
             self.show_inpainting_mask
-            and inpainted_img is not None
+            and inpainted_image is not None
             and inpainting_counts is not None
         ):
-            inpainted_img = T.ToPILImage()(inpainted_img)
+            inpainted_image = T.ToPILImage()(inpainted_image)
             inpainting_counts = T.ToPILImage()(inpainting_counts)
-            inpainted_img.show()
+            inpainted_image.show()
             inpainting_counts.show()
         if self.show_inpainted_image:
-            final_img.show()
-        return final_img
+            _final_image.show()
+        # For compatibility with other stages
+        return inpainting_masks
+
+    @property
+    def output(self) -> TensorType["C", "H", "W"]:
+        if self._output is None:
+            raise ValueError("output has not been computed yet")
+        return self._output
 
 
 class BlendingImpl:
     @abstractmethod
     def __call__(
-        self, img: torch.Tensor, inpaintings: list[InpainingMask]
+        self, image: torch.Tensor, inpaintings: list[InpainingMask]
     ) -> torch.Tensor:
         pass
 
 
 class AverageBlending(BlendingImpl):
     def __call__(
-        self, img: torch.Tensor, inpaintings: list[InpainingMask]
+        self, image: torch.Tensor, inpaintings: list[InpainingMask]
     ) -> torch.Tensor:
         # Assemble final image
-        inpainted_img = torch.zeros_like(img)  # Store all inpainted regions here
+        inpainted_image = torch.zeros_like(image)  # Store all inpainted regions here
         inpainting_counts = torch.zeros_like(
-            img
+            image
         )  # Count how many pixels have been added to each spot
         for m in inpaintings:
             # Store the inpainted patch into a new image
             inpainted_patch = torch.where(
-                m.mask.bool(), m.inpainted_img, torch.scalar_tensor(0).float()
+                m.mask.bool(), m.inpainted_image, torch.scalar_tensor(0).float()
             )
-            inpainted_img[
+            inpainted_image[
                 :, m.box.ymin : m.box.ymax, m.box.xmin : m.box.xmax
             ] += inpainted_patch
             # Update how many times each pixel in the image has been inpainted
@@ -501,13 +524,13 @@ class AverageBlending(BlendingImpl):
             ] += inpainted_count_patch
         # Average the inpaintings of all the images.
         # Set all counts at least to 1 to avoid division-by-zero
-        inpainted_img /= torch.maximum(
+        inpainted_image /= torch.maximum(
             inpainting_counts, torch.ones_like(inpainting_counts)
         )
         # Create mask to merge original image with inpainted spots
         mask = (inpainting_counts > 0).int()
         # Create final image
-        final_img = img * (1 - mask) + inpainted_img * mask
+        final_image = image * (1 - mask) + inpainted_image * mask
 
         # Do a final merge where we blur the original mask,
         # to make blending a bit smoother
@@ -517,23 +540,23 @@ class AverageBlending(BlendingImpl):
                 cv2.dilate(mask[0, ...].float().numpy(), kernel, iterations=1)
             ).repeat(3, 1, 1)
             mask = functional.gaussian_blur(mask, 15)
-            final_img = img * (1 - mask) + final_img * mask
+            final_image = image * (1 - mask) + final_image * mask
 
-        return final_img, inpainted_img, inpainting_counts
+        return final_image, inpainted_image, inpainting_counts
 
 
 class PatchwiseAssemble(BlendingImpl):
     def __call__(
-        self, img: torch.Tensor, inpaintings: list[InpainingMask]
+        self, image: torch.Tensor, inpaintings: list[InpainingMask]
     ) -> torch.Tensor:
-        final_img = img.clone()
+        final_image = image.clone()
         for m in inpaintings:
             # Don't merge full patch, but only masked part.
-            inpainted_patch = torch.where(m.mask.bool(), m.inpainted_img, m.img)
-            final_img[
+            inpainted_patch = torch.where(m.mask.bool(), m.inpainted_image, m.image)
+            final_image[
                 :, m.box.ymin : m.box.ymax, m.box.xmin : m.box.xmax
             ] = inpainted_patch
-        return final_img, None, None
+        return final_image, None, None
 
 
 class BlendingEnum(Enum):
@@ -557,6 +580,18 @@ class BlendingEnum(Enum):
 class Vaporizer:
 
     def __init__(self) -> None:
+        
+        # self.stages = [
+        #     # Initialize model for object detection
+        #     ObjectDetection(),
+        #     # Initialize model for semanting segmentation
+        #     SemanticSegmentation(),
+        #     # Initialize model for inpaining
+        #     Inpainting(),
+        #     # How to blend inpainted patches to assemble the final image
+        #     Blending("average", True, True)
+        # ]
+        
         # Initialize model for object detection
         self.object_detection = ObjectDetection()
         # Initialize model for semanting segmentation
@@ -587,27 +622,28 @@ class Vaporizer:
         print(f"removed {len(masks) - len(filtered_masks)} masks")
         return filtered_masks
         
-    def __call__(self, image: Union[str, list[str]]) -> None:
+    def __call__(self, image_paths: Union[str, list[str]]) -> None:
         # Process a list of image paths
-        if isinstance(image, str):
-            image = [image]
+        if isinstance(image_paths, str):
+            image_paths = [image_paths]
         result = {}
-        for image_path in image:
+        for image_path in image_paths:
+
+            image = self.load_image(image_path)
+
             # Get bounding boxes of humans
-            boxes = self.object_detection(image_path)
+            inpainting_masks = self.object_detection(image=image)
 
             # Increase each box by 50%, then make it square (and at least 224x224 in size)
-            for b in boxes:
-                b.scale(BOUNDING_BOX_INCREASE_FACTOR).to_square(BOUNDING_BOX_MIN_SIZE)
+            for m in inpainting_masks:
+                m.box.scale(BOUNDING_BOX_INCREASE_FACTOR).to_square(BOUNDING_BOX_MIN_SIZE)
 
             # Semanting segmentation on each bounding box, create segmentation mask for humans
-            img = Image.open(image_path)
-            img = T.ToTensor()(img)
-            masks = self.semanting_segmentation(img, boxes)
+            inpainting_masks = self.semanting_segmentation(image=image, inpainting_masks=inpainting_masks)
 
             # Clean and expand segmentation masks, to improve inpainting
             # Also remove any segmentation mask that touches the border
-            masks = self._clean_masks(masks)
+            inpainting_masks = self._clean_masks(inpainting_masks)
 
             # TODO: handle shadows: identify each contiguous region in the mask, flip it vertically, shift it down, and extrude
             # To identify regions, use the original bounding boxes. Extend them by 10% to be safe, but only left/right/top, not bottom
@@ -615,32 +651,41 @@ class Vaporizer:
 
             # Merge blocks with IoU above `IOU_FILTER_THRESHOLD`.
             # Keep the mask with biggest segmentation mask
-            masks = self._merge_similar_masks(masks)
+            inpainting_masks = self._merge_similar_masks(inpainting_masks)
 
             # Merge all segmentation masks into one, then create bounding boxes over white regions
             # Then do inpainting on these new bounding boxes.
             # Better cause we don't have to worry about merging original boxes
             if CONDENSE_SEGMENTATION_MASKS:
-                masks = self._create_condensed_masks(img, masks)
+                inpainting_masks = self._create_condensed_masks(image, inpainting_masks)
 
             # Vaporize humans
-            masks = self.inpainting(masks)
+            inpainting_masks = self.inpainting(inpainting_masks=inpainting_masks)
 
             # Visualize inpainted masks
-            # for m in masks:
+            # for m in segmentation_masks:
             #     m.show()
 
             # Assemble final image
-            final_img = self.blending(img, masks)
+            inpainting_masks = self.blending(image, inpainting_masks)
+            final_image = self.blending.output
+            
+            # Store result
+            result[image_path] = {"inpaintings": inpainting_masks, "final_image": final_image, "original_image": image}
 
             # Compute PSNR w.r.t. manually retouched image
             if os.path.basename(image_path) in os.listdir(GOLDEN_FOLDER):
                 golden = T.ToTensor()(
                     Image.open(os.path.join(GOLDEN_FOLDER, os.path.basename(image_path)))
                 )
-                print(f"PSNR={psnr(T.ToTensor()(final_img), golden):.4f} dB")
-            result[image_path] = {"inpaintings": masks, "final_image": final_img, "original_image": img}
+                _psnr = psnr(final_image, golden)
+                result[image_path] |= {"psnr": _psnr}
+                print(f"PSNR={_psnr:.4f} dB")
+            
         return result
+
+    def load_image(self, image_path: str) -> TensorType["C", "H", "W"]:
+        return T.ToTensor()(Image.open(image_path))
     
     @timeit()
     def _clean_masks(self, masks: list[InpainingMask], erode: int = 2, dilate: int = 15) -> list[InpainingMask]:
@@ -658,7 +703,7 @@ class Vaporizer:
         return [m for m in masks if m.mask.sum() > 0]
 
     @timeit()
-    def _create_condensed_masks(self, img: torch.Tensor, masks: list[InpainingMask]) -> list[InpainingMask]:
+    def _create_condensed_masks(self, image: torch.Tensor, masks: list[InpainingMask]) -> list[InpainingMask]:
         """
         Merge all segmentation masks into one, 
           then create bounding boxes over white regions.
@@ -668,7 +713,7 @@ class Vaporizer:
         """
        
         # First, merge all segmentation masks into a unique mask
-        total_mask = torch.zeros(img.shape).bool()[0, ...]
+        total_mask = torch.zeros(image.shape).bool()[0, ...]
         for m in masks:
             # Don't merge the full patch, but only the masked parts
             total_mask[
@@ -691,9 +736,9 @@ class Vaporizer:
         # Create new segmentation masks
         new_masks = []
         for b in boxes:
-            img_patch = img[:, b.ymin : b.ymax, b.xmin : b.xmax]
+            image_patch = image[:, b.ymin : b.ymax, b.xmin : b.xmax]
             mask = total_mask[b.ymin : b.ymax, b.xmin : b.xmax]
-            new_masks += [InpainingMask(b, img_patch, mask, None)]
+            new_masks += [InpainingMask(b, image_patch, mask, None)]
             
         # Do a final filtering step to remove unnecessary masks
         new_masks = self._merge_similar_masks(new_masks)
@@ -704,7 +749,7 @@ class Vaporizer:
 if __name__ == "__main__":
 
     # Images
-    imgs = sorted(
+    images = sorted(
         [
             os.path.join(DATA_FOLDER, x)
             for x in os.listdir(DATA_FOLDER)
@@ -714,6 +759,6 @@ if __name__ == "__main__":
     
     # Inference
     vaporizer = Vaporizer()
-    result = vaporizer(imgs)
+    result = vaporizer(images)
 
        

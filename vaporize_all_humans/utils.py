@@ -2,14 +2,15 @@ import os
 import time
 from argparse import Namespace
 from functools import wraps
-from typing import Any, Callable, TypeVar, Union
+from pathlib import Path
+from typing import Any, Callable, TypeVar
 
 import numpy as np
 import torch
+import torchvision.transforms as T
 from torchtyping import TensorType
 
-from vaporize_all_humans.config import DATA_FOLDER
-from vaporize_all_humans.utils import is_image_file
+from vaporize_all_humans.config import DATA_FOLDER, OUTPUT_FOLDER
 
 F = TypeVar("F")  # Frames
 C = TypeVar("C")  # Channels
@@ -79,7 +80,8 @@ def get_demo_images() -> list[str]:
     )
 
 
-def validate_input_images(image_paths: Union[str, list[str]]) -> None:
+def validate_input_images(image_paths: list[str]) -> None:
+    assert len(image_paths) > 0, "the list of input images cannot be empty"
     for img in image_paths:
         assert os.path.exists(img), f"input image {img} does not exists"
         assert is_image_file(
@@ -89,5 +91,44 @@ def validate_input_images(image_paths: Union[str, list[str]]) -> None:
 
 def get_input_images(args: Namespace) -> list[str]:
     image_paths = get_demo_images() if args.demo else args.input
-    image_paths(image_paths)
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
+    validate_input_images(image_paths)
     return image_paths
+
+
+def get_output_directory(args: Namespace, image_path: str) -> str:
+    if args.demo:
+        # Default directory for the demo
+        output_directory = OUTPUT_FOLDER
+        Path(output_directory).mkdir(exist_ok=True)
+    elif args.output_directory is not None:
+        # Directory specified by the user
+        output_directory = args.output_directory
+    else:
+        # Directory of the current image
+        output_directory = str(Path(image_path).parent)
+    assert os.path.isdir(
+        output_directory
+    ), f"output directory {output_directory} does not exist"
+    return output_directory
+
+
+def store_output_images(args: Namespace, result: dict[str, Any]):
+    if not args.disable_output_save:
+        for image_path, r in result.items():
+            # Where to store the image
+            output_directory = get_output_directory(args, image_path)
+            # Get name of the input image
+            image_name, extension = os.path.splitext(os.path.basename(image_path))
+            extension = extension[1:]  # Remove leading `.`
+            # Add extension to the basename
+            if not args.disable_output_suffix:
+                image_name += args.output_suffix
+            # Store the image, using the same extension as the input
+            kwargs = {}
+            if extension.lower() in ["jpg", "jpeg"]:
+                kwargs = {"quality": 80, "optimize": True}
+            T.ToPILImage()(r["predicted_image"]).save(
+                os.path.join(output_directory, f"{image_name}.{extension}", **kwargs)
+            )

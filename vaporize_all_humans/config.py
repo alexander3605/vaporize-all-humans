@@ -3,6 +3,7 @@ from argparse import ArgumentParser, Namespace
 
 DATA_FOLDER = "data/samples"
 GOLDEN_FOLDER = os.path.join(DATA_FOLDER, "golden")
+OUTPUT_FOLDER = os.path.join(DATA_FOLDER, "output")
 BOUNDING_BOX_MIN_SIZE = 512
 BOUNDING_BOX_INCREASE_FACTOR = 0.5
 IOU_FILTER_THRESHOLD = 0.5
@@ -18,7 +19,6 @@ def parse_arguments() -> Namespace:
     parser.add_argument(
         "-i",
         "--input",
-        required=True,
         type=str,
         nargs="+",
         help="Path to one or more images from which to erase humans.",
@@ -37,6 +37,15 @@ def parse_arguments() -> Namespace:
         type=str,
         default="-VAPORIZED",
         help="Suffix appended to each output image.",
+    )
+    parser.add_argument(
+        "--disable-output-suffix",
+        action="store_true",
+        help="""
+            If present, do not append any suffix to the output image.
+            Be careful, if output-directory is not present, this will 
+            override the input images!
+        """,
     )
     parser.add_argument(
         "--disable-output-save",

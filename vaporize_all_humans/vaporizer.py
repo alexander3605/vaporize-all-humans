@@ -112,6 +112,8 @@ class Vaporizer:
             image_paths = [image_paths]
         self._output = {}
         for image_path in image_paths:
+            print(f"\nVAPORIZE HUMANS IN {image_path}!")
+            
             # Load the image as a tensor
             image = self._load_image(image_path)
             # Compute each step in the pipeline

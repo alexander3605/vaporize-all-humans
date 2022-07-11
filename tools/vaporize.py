@@ -13,7 +13,7 @@ if __name__ == "__main__":
     args = parse_arguments()
 
     # Get the list of images to process
-    images = get_input_images(args)[:3]
+    images = get_input_images(args)
 
     # Create a vaporizer
     vaporizer = Vaporizer(

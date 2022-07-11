@@ -10,10 +10,10 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as functional
 from torchtyping import TensorType
 
-from vaporize_all_humans.utils import C, H, W, timeit
+from vaporize_all_humans.config import GAUSSIAN_BLUR_ON_MERGE
 from vaporize_all_humans.inpainting_mask import InpaintingMask
 from vaporize_all_humans.step.vaporizer_step import VaporizerStep
-from vaporize_all_humans.config import GAUSSIAN_BLUR_ON_MERGE
+from vaporize_all_humans.utils import C, H, W, timeit
 
 
 @dataclass

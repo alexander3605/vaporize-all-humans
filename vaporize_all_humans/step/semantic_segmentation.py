@@ -1,14 +1,16 @@
 from dataclasses import dataclass
-from vaporize_all_humans.step.vaporizer_step import VaporizerStep
-from vaporize_all_humans.inpainting_mask import InpaintingMask
-from torchtyping import TensorType
-from typing import Optional, ClassVar
+from typing import ClassVar, Optional
+
 import torch
-from vaporize_all_humans.utils import timeit
-from torchvision.models.segmentation import fcn_resnet50
 import torchvision.transforms.functional as functional
+from torchtyping import TensorType
+from torchvision.models.segmentation import fcn_resnet50
+
+from vaporize_all_humans.inpainting_mask import InpaintingMask
+from vaporize_all_humans.step.vaporizer_step import VaporizerStep
 from vaporize_all_humans.utils import (C, F, H, W, all_tensors_have_same_shape,
                                        is_image_file, psnr, timeit)
+
 
 @dataclass
 class SemanticSegmentation(VaporizerStep):

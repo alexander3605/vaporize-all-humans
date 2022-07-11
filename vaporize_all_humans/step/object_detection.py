@@ -1,12 +1,14 @@
 from dataclasses import dataclass
-from vaporize_all_humans.step.vaporizer_step import VaporizerStep
+from typing import Optional
+
+import numpy as np
+import torch
+import torchvision.transforms as T
+from torchtyping import TensorType
+
 from vaporize_all_humans.bounding_box import BoundingBox
 from vaporize_all_humans.inpainting_mask import InpaintingMask
-from torchtyping import TensorType
-from typing import Optional
-import torch
-import numpy as np
-import torchvision.transforms as T
+from vaporize_all_humans.step.vaporizer_step import VaporizerStep
 from vaporize_all_humans.utils import C, H, W, timeit
 
 

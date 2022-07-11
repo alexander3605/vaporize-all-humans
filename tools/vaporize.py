@@ -1,7 +1,8 @@
-from vaporize_all_humans.vaporizer import Vaporizer
-from vaporize_all_humans.utils import is_image_file
 import os
+
 from vaporize_all_humans.config import DATA_FOLDER
+from vaporize_all_humans.utils import is_image_file
+from vaporize_all_humans.vaporizer import Vaporizer
 
 # TODO: handle shadows: identify each contiguous region in the mask, flip it vertically, shift it down, and extrude
 # To identify regions, use the original bounding boxes. Extend them by 10% to be safe, but only left/right/top, not bottom
@@ -17,8 +18,9 @@ if __name__ == "__main__":
             for x in os.listdir(DATA_FOLDER)
             if is_image_file(x)
         ]
-    )[2:3]
+    )
 
     # Inference
-    vaporizer = Vaporizer()
-    result = vaporizer(images)
+    vaporizer = Vaporizer()(images)
+    result = vaporizer.dataframe
+    print(result)

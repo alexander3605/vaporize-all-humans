@@ -1,13 +1,18 @@
-from dataclasses import dataclass
 from abc import ABC
+from dataclasses import dataclass
 from typing import Optional
+
 import cv2
-from vaporize_all_humans.bounding_box import BoundingBox
-from torchtyping import TensorType
-from vaporize_all_humans.inpainting_mask import InpaintingMask
-from vaporize_all_humans.config import BOUNDING_BOX_INCREASE_FACTOR, BOUNDING_BOX_MIN_SIZE, IOU_FILTER_THRESHOLD
-from vaporize_all_humans.utils import timeit, C, H, W
 import torch
+from torchtyping import TensorType
+
+from vaporize_all_humans.bounding_box import BoundingBox
+from vaporize_all_humans.config import (BOUNDING_BOX_INCREASE_FACTOR,
+                                        BOUNDING_BOX_MIN_SIZE,
+                                        IOU_FILTER_THRESHOLD)
+from vaporize_all_humans.inpainting_mask import InpaintingMask
+from vaporize_all_humans.utils import C, H, W, timeit
+
 
 @dataclass
 class VaporizerStep(ABC):

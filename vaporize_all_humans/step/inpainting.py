@@ -1,18 +1,19 @@
 import os
 from dataclasses import dataclass
 from typing import ClassVar, Optional
+
 import torch
 import torchvision.transforms.functional as functional
 import yaml
 from omegaconf import OmegaConf
 from torchtyping import TensorType
 
-from external.lama.saicinpainting.training.trainers.default import (
-    DefaultInpaintingTrainingModule,
-)
-from vaporize_all_humans.utils import C, H, W, all_tensors_have_same_shape, timeit
+from external.lama.saicinpainting.training.trainers.default import \
+    DefaultInpaintingTrainingModule
 from vaporize_all_humans.inpainting_mask import InpaintingMask
 from vaporize_all_humans.step.vaporizer_step import VaporizerStep
+from vaporize_all_humans.utils import (C, H, W, all_tensors_have_same_shape,
+                                       timeit)
 
 
 @dataclass

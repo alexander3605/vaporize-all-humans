@@ -1,4 +1,5 @@
 import dataclasses as dataclass
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -10,7 +11,7 @@ from torchvision.utils import make_grid
 
 from vaporize_all_humans.bounding_box import BoundingBox
 from vaporize_all_humans.utils import C, H, W
-from dataclasses import dataclass
+
 
 @dataclass
 class InpaintingMask:

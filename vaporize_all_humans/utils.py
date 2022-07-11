@@ -130,5 +130,5 @@ def store_output_images(args: Namespace, result: dict[str, Any]):
             if extension.lower() in ["jpg", "jpeg"]:
                 kwargs = {"quality": 80, "optimize": True}
             T.ToPILImage()(r["predicted_image"]).save(
-                os.path.join(output_directory, f"{image_name}.{extension}", **kwargs)
+                os.path.join(output_directory, f"{image_name}.{extension}"), **kwargs
             )

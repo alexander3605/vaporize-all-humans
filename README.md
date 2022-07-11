@@ -1,4 +1,4 @@
-# VAPORIZE ALL HUMANS! 
+# VAPORIZE ALL HUMANS! :gun:
 
 ```
 conda create --name human_vaporizer

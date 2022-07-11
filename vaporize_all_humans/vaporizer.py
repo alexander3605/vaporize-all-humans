@@ -1,4 +1,6 @@
 import os
+from dataclasses import dataclass
+from telnetlib import GA
 from typing import Any, Optional, Union
 
 import pandas as pd
@@ -6,8 +8,11 @@ import torchvision.transforms as T
 from PIL import Image
 from torchtyping import TensorType
 
-from vaporize_all_humans.config import (CONDENSE_SEGMENTATION_MASKS,
-                                        GOLDEN_FOLDER)
+from vaporize_all_humans.config import (BOUNDING_BOX_INCREASE_FACTOR,
+                                        BOUNDING_BOX_MIN_SIZE,
+                                        CONDENSE_SEGMENTATION_MASKS,
+                                        GAUSSIAN_BLUR_ON_MERGE, GOLDEN_FOLDER,
+                                        IOU_FILTER_THRESHOLD)
 from vaporize_all_humans.step.blending import Blending
 from vaporize_all_humans.step.inpainting import Inpainting
 from vaporize_all_humans.step.object_detection import ObjectDetection
@@ -18,17 +23,39 @@ from vaporize_all_humans.step.vaporizer_step import (
 from vaporize_all_humans.utils import C, H, W, psnr
 
 
+@dataclass
 class Vaporizer:
-    def __init__(self) -> None:
+
+    patch_size: int = BOUNDING_BOX_MIN_SIZE
+    patch_increase_factor: float = BOUNDING_BOX_INCREASE_FACTOR
+    iou_filter_threshold: float = IOU_FILTER_THRESHOLD
+    blur_stitching: bool = GAUSSIAN_BLUR_ON_MERGE
+    patches_condensation: bool = CONDENSE_SEGMENTATION_MASKS
+    show_patches: bool = False
+    show_mask: bool = False
+    show_result: bool = False
+
+    def __post_init__(self) -> None:
+
+        ####################
+        ### Define steps ###
+        ####################
+
         # Object detection
-        self.steps: list[VaporizerStep] = [ObjectDetection(), ScaleBoundingBoxes()]
+        self.steps: list[VaporizerStep] = [
+            ObjectDetection(),
+            ScaleBoundingBoxes(
+                bounding_box_increase_factor=self.patch_increase_factor,
+                bounding_box_minimum_size=self.patch_size,
+            ),
+        ]
         # Semanting segmentation
         self.steps += [
             SemanticSegmentation(),
             CleanInpaintingMasks(),
             MergeOverlappingInpaintingMasks(),
         ]
-        if CONDENSE_SEGMENTATION_MASKS:
+        if self.patches_condensation:
             self.steps += [
                 CondenseInpaintingMasks(),
                 MergeOverlappingInpaintingMasks(),
@@ -36,8 +63,13 @@ class Vaporizer:
         # Inpainting
         self.steps += [
             Inpainting(),
-            Blending("average", True, True),
+            Blending("average", self.show_result, self.show_mask),
         ]
+
+        ####################
+        ####################
+        ####################
+
         assert isinstance(
             self.steps[-1], Blending
         ), f"the last step of the vaporizer pipeline must be a Blending, not {type(self.steps[-1])}"
@@ -56,7 +88,7 @@ class Vaporizer:
             raise ValueError("output has not been computed yet")
         rows = []
         for image, result in self._output.items():
-            rows += [image, result["psnr"], len(result["inpaintings"])]
+            rows += [[image, result["psnr"], len(result["inpaintings"])]]
         return pd.DataFrame(rows, columns=["image", "psnr", "number_of_inpaintings"])
 
     def _load_image(self, image_path: str) -> TensorType["C", "H", "W"]:
@@ -89,8 +121,9 @@ class Vaporizer:
             # Obtain the final image from the blending step
             predicted_image = self.steps[-1].output
             # Visualize inpainted masks
-            # for m in inpainting_masks:
-            #     m.show()
+            if self.show_patches:
+                for m in inpainting_masks:
+                    m.show()
             # Store result
             self._output[image_path] = {
                 "inpaintings": inpainting_masks,

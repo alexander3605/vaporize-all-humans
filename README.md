@@ -5,8 +5,10 @@ Wish you could just turn them all to **cosmic dust** with a simple click?
 Worry no more! 
 
 <p align="center">
-  <img src="https://github.com/AlbertoParravicini/vaporize-all-humans/tree/master/data/gif/vaporizer.gif" />
+  <img src="/data/gif/vaporizer.gif?raw=true" width="1200px">
 </p>
+
+
 
 The human vaporizer is still being calibrated: some ingenious humans might still escape it, and some traces of vaporized humans might be left of in the final picture.
 

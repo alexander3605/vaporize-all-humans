@@ -137,5 +137,5 @@ dmypy.json
 *.sw?
 
 LaMa_test_images/
-models/
 LaMa_models/
+big-lama/

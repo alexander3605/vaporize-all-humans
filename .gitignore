@@ -2,3 +2,4 @@
 **/__pycache__
 notebooks/yolov5s.pt
 yolov5s.pt
+data/samples/output/

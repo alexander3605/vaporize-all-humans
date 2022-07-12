@@ -1,11 +1,11 @@
 [tool.poetry]
 name = "vaporize-all-humans"
 version = "0.1.0"
-description = ""
+description = "Vaporize tiny little humans in your pictures!"
 authors = ["Alberto Parravicini"]
 
 [tool.poetry.dependencies]
-python = "^3.9"
+python = ">=3.10,<3.11"
 torch = "1.11.0"
 spyder-kernels = "^2.3.2"
 opencv-python = "^4.6.0"
@@ -13,6 +13,22 @@ black = "^22.6.0"
 torchtyping = "^0.1.4"
 webdataset = "^0.2.5"
 isort = "^5.10.1"
+albumentations = "^0.5.2"
+hydra-core = "^1.2.0"
+kornia = "^0.5.0"
+matplotlib = "^3.5.2"
+numpy = "^1.23.0"
+pandas = "^1.4.3"
+pytorch-lightning = "^1.2.9"
+scipy = "^1.8.1"
+scikit-learn = "^1.1.1"
+seaborn = "^0.11.2"
+setuptools = "^63.1.0"
+tensorboard = "^2.9.1"
+tqdm = "^4.64.0"
+torchvision = "^0.12"
+easydict = "^1.9"
+"wldhx.yadisk-direct" = "^0.0.6"
 
 [tool.poetry.dev-dependencies]
 pytest = "^5.2"

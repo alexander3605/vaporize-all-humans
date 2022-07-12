@@ -8,18 +8,25 @@ import torchvision.transforms as T
 from PIL import Image
 from torchtyping import TensorType
 
-from vaporize_all_humans.config import (BOUNDING_BOX_INCREASE_FACTOR,
-                                        BOUNDING_BOX_MIN_SIZE,
-                                        CONDENSE_SEGMENTATION_MASKS,
-                                        GAUSSIAN_BLUR_ON_MERGE, GOLDEN_FOLDER,
-                                        IOU_FILTER_THRESHOLD)
+from vaporize_all_humans.config import (
+    BOUNDING_BOX_INCREASE_FACTOR,
+    BOUNDING_BOX_MIN_SIZE,
+    CONDENSE_SEGMENTATION_MASKS,
+    GAUSSIAN_BLUR_ON_MERGE,
+    GOLDEN_FOLDER,
+    IOU_FILTER_THRESHOLD,
+)
 from vaporize_all_humans.step.blending import Blending
 from vaporize_all_humans.step.inpainting import Inpainting
 from vaporize_all_humans.step.object_detection import ObjectDetection
 from vaporize_all_humans.step.semantic_segmentation import SemanticSegmentation
 from vaporize_all_humans.step.vaporizer_step import (
-    CleanInpaintingMasks, CondenseInpaintingMasks,
-    MergeOverlappingInpaintingMasks, ScaleBoundingBoxes, VaporizerStep)
+    CleanInpaintingMasks,
+    CondenseInpaintingMasks,
+    MergeOverlappingInpaintingMasks,
+    ScaleBoundingBoxes,
+    VaporizerStep,
+)
 from vaporize_all_humans.utils import C, H, W, psnr
 
 
@@ -41,8 +48,10 @@ class Vaporizer:
         ### Define steps ###
         ####################
 
+        self.steps: list[VaporizerStep] = []
+
         # Object detection
-        self.steps: list[VaporizerStep] = [
+        self.steps += [
             ObjectDetection(),
             ScaleBoundingBoxes(
                 bounding_box_increase_factor=self.patch_increase_factor,
@@ -113,7 +122,7 @@ class Vaporizer:
         self._output = {}
         for image_path in image_paths:
             print(f"\nVAPORIZE HUMANS IN {image_path}!")
-            
+
             # Load the image as a tensor
             image = self._load_image(image_path)
             # Compute each step in the pipeline

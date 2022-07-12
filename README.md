@@ -4,7 +4,9 @@ Have you ever had your beautiful pictures ruined by an overabundance of those li
 Wish you could just turn them all to **cosmic dust** with a simple click?
 Worry no more! 
 
-![Vaporizer in action!](https://github.com/AlbertoParravicini/vaporize-all-humans/tree/master/data/gif/vaporizer.gif)
+<p align="center">
+  <img src="https://github.com/AlbertoParravicini/vaporize-all-humans/tree/master/data/gif/vaporizer.gif" />
+</p>
 
 The human vaporizer is still being calibrated: some ingenious humans might still escape it, and some traces of vaporized humans might be left of in the final picture.
 
